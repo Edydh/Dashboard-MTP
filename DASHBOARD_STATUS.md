@@ -154,7 +154,7 @@ cat ACTUAL_SCHEMA.md
 
 **Last Updated:** 2025-09-10 17:35  
 **Environment:** Production  
-**Supabase Project:** kkuwiatnfbmknfminnmd
+**Supabase Project:** [YOUR_PROJECT_ID]
 
 ---
 
