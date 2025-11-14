@@ -2046,8 +2046,9 @@ def main():
                         cost_distance_data,
                         x='distance',
                         y='fuel_cost',
-                        title="Fuel Cost vs Distance",
+                        title="Fuel Cost vs Distance (with Trend Line)",
                         labels={'distance': 'Distance (miles)', 'fuel_cost': 'Fuel Cost ($)'},
+                        trendline="ols",
                         color_discrete_sequence=['#FF6B6B']
                     )
                     st.plotly_chart(fig, use_container_width=True)
