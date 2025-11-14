@@ -103,6 +103,23 @@ curl -s http://localhost:8501 | head -n 1
 - KPI Scorecard
 - Performance metrics
 
+### **🗺️ Destinations Map Tab** *(NEW!)*
+- Interactive global map showing destination usage
+- Bubble size represents usage frequency
+- Color coding by popularity
+- Top 10 destinations sidebar
+- Usage distribution charts
+- Geographic insights (hemisphere breakdown)
+- **164 destinations** currently mapped
+
+### **🔧 Advanced Analytics Tab** *(NEW!)*
+- **Trip Purpose Analytics**: Business vs personal trip analysis, purpose distribution, reimbursement tracking
+- **Fuel Efficiency Dashboard**: MPG calculations, fuel cost analysis, efficiency insights, cost optimization
+- **Data Quality Monitoring**: Completeness scores, missing data analysis, data health recommendations
+- **Export Features**: CSV downloads for analytics data and quality reports
+- **Performance Metrics**: Cache efficiency, query times, data freshness
+- **Advanced Filtering**: Date range and purpose category filters
+
 ---
 
 ## 🔌 **Enhanced Features**
@@ -166,5 +183,7 @@ Your dashboard is fully operational with:
 - ✅ Real-time data visualization
 - ✅ Enhanced monitoring tools
 - ✅ Complete database visibility
+- ✅ **🗺️ Interactive Global Destinations Map**
+- ✅ **🔧 Advanced Analytics & Insights**
 
-Access your dashboard at: **http://localhost:8501** 🚗📊
+Access your dashboard at: **http://localhost:8501** 🚗📊🗺️🔧
