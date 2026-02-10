@@ -1,0 +1,267 @@
+{
+  "generated_at": "2025-11-13T21:52:15.446970",
+  "environment": "production",
+  "tables": {
+    "profiles": {
+      "info": {
+        "name": "profiles",
+        "columns": {
+          "id": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "07c55101-a153-46e8-bbb5-d2559655cb09",
+              "df9e1b17-8c84-48e2-999e-1cb983889935",
+              "725bba2b-2bf5-40d6-ac75-c3fd085dbfec"
+            ]
+          },
+          "full_name": {
+            "type": "str",
+            "nullable": true,
+            "sample_values": [
+              "Christa Weaver"
+            ]
+          },
+          "photo_url": {
+            "type": "unknown",
+            "nullable": true,
+            "sample_values": []
+          },
+          "phone_number": {
+            "type": "str",
+            "nullable": true,
+            "sample_values": [
+              "2072539473"
+            ]
+          },
+          "created_at": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "2025-10-22T04:12:20.008059+00:00",
+              "2025-09-30T05:52:44.140766+00:00",
+              "2025-10-21T22:14:40.026755+00:00"
+            ]
+          },
+          "updated_at": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "2025-10-22T04:12:20.008059+00:00",
+              "2025-09-30T05:52:44.140766+00:00",
+              "2025-10-21T22:14:40.026755+00:00"
+            ]
+          },
+          "subscription_tier": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "free"
+            ]
+          }
+        },
+        "row_count": 54,
+        "sample_data": [
+          {
+            "id": "df9e1b17-8c84-48e2-999e-1cb983889935",
+            "full_name": "Christa Weaver",
+            "photo_url": null,
+            "phone_number": "2072539473",
+            "created_at": "2025-10-21T22:14:40.026755+00:00",
+            "updated_at": "2025-10-21T22:14:40.026755+00:00",
+            "subscription_tier": "free"
+          },
+          {
+            "id": "07c55101-a153-46e8-bbb5-d2559655cb09",
+            "full_name": null,
+            "photo_url": null,
+            "phone_number": null,
+            "created_at": "2025-10-22T04:12:20.008059+00:00",
+            "updated_at": "2025-10-22T04:12:20.008059+00:00",
+            "subscription_tier": "free"
+          }
+        ],
+        "error": null
+      },
+      "statistics": {
+        "subscription_distribution": {
+          "free": 51,
+          "premium": 3
+        },
+        "error": "Invalid comparison between dtype=datetime64[ns, UTC] and Timestamp"
+      }
+    },
+    "trips": {
+      "info": {
+        "name": "trips",
+        "columns": {
+          "id": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "c35fde11-65ff-458e-b82f-34a1bdbf53f2",
+              "226d92c8-740b-49e1-aac5-780b1eb33c16",
+              "e092a515-c833-418c-9dcc-b42005f15dfc"
+            ]
+          },
+          "user_id": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "fd1d74cc-5cdc-4e16-acb1-58aa5e3c431c"
+            ]
+          },
+          "date": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "2025-05-20T15:03:08.708+00:00",
+              "2025-06-13T18:48:16.734+00:00",
+              "2025-05-23T18:18:01.226+00:00"
+            ]
+          },
+          "start_time": {
+            "type": "unknown",
+            "nullable": true,
+            "sample_values": [
+              "2025-06-13T18:48:16.734+00:00",
+              "2025-05-23T18:18:01.226+00:00"
+            ]
+          },
+          "end_time": {
+            "type": "unknown",
+            "nullable": true,
+            "sample_values": [
+              "2025-05-23T19:33:42.796+00:00",
+              "2025-06-13T18:48:16.734+00:00"
+            ]
+          },
+          "start_location": {
+            "type": "str",
+            "nullable": true,
+            "sample_values": [
+              "155 Nonquon Rd PH07, Oshawa, ON L1G 3S1, Canada",
+              "5225 Orbitor Dr, Orbitor Dr, Mississauga, ON, L4W 4Y8, Canada"
+            ]
+          },
+          "end_location": {
+            "type": "unknown",
+            "nullable": true,
+            "sample_values": [
+              "131 Taunton Rd E, Taunton Rd E, Oshawa, ON, L1G 3T8, Canada"
+            ]
+          },
+          "mileage": {
+            "type": "float",
+            "nullable": false,
+            "sample_values": [
+              89.0,
+              78.0
+            ]
+          },
+          "purpose": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "Business"
+            ]
+          },
+          "is_round_trip": {
+            "type": "bool",
+            "nullable": false,
+            "sample_values": [
+              false
+            ]
+          },
+          "notes": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "SV1649800\nSS&C",
+              "SV1646500",
+              "SV1678380\nThe Nasdaq Stock Market LLC"
+            ]
+          },
+          "created_at": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "2025-05-20T15:05:28.697085+00:00",
+              "2025-05-23T18:19:33.116724+00:00",
+              "2025-06-13T18:49:23.51582+00:00"
+            ]
+          },
+          "updated_at": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "2025-05-20T15:05:28.697085+00:00",
+              "2025-05-23T18:19:33.116724+00:00",
+              "2025-06-13T18:49:23.51582+00:00"
+            ]
+          },
+          "planned_distance": {
+            "type": "unknown",
+            "nullable": true,
+            "sample_values": [
+              82.177
+            ]
+          },
+          "status": {
+            "type": "str",
+            "nullable": false,
+            "sample_values": [
+              "active",
+              "completed"
+            ]
+          }
+        },
+        "row_count": 445,
+        "sample_data": null,
+        "error": "unhashable type: 'list'"
+      },
+      "statistics": {
+        "mileage": {
+          "min": 0.0,
+          "max": 533.94,
+          "mean": 74.7723595505618,
+          "sum": 33273.700000000004,
+          "null_count": "0"
+        },
+        "actual_distance": {
+          "min": 0.0,
+          "max": 130.90027022816,
+          "mean": 40.27827176596874,
+          "sum": 1208.3481529790622,
+          "null_count": "415"
+        },
+        "planned_distance": {
+          "min": 0.63,
+          "max": 526.27,
+          "mean": 66.06425598086123,
+          "sum": 27614.858999999997,
+          "null_count": "27"
+        },
+        "fuel_used": {
+          "min": 0.0,
+          "max": 42.7152,
+          "mean": 5.0448194117759835,
+          "sum": 2234.8549994167606,
+          "null_count": "2"
+        },
+        "reimbursement": {
+          "min": 0.0,
+          "max": 373.75800000000004,
+          "mean": 44.78494345437332,
+          "sum": 19929.299837196126,
+          "null_count": "0"
+        },
+        "date_range": {
+          "earliest": "2025-05-20 15:05:28.697085+00:00",
+          "latest": "2025-11-13 20:21:04.084245+00:00",
+          "total_days": 177
+        }
+      }
+    }
+  }
+}

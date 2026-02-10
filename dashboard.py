@@ -106,8 +106,20 @@ def get_top_active_users(_supabase: Client, limit=10):
         trips_df = pd.DataFrame(trips_response.data)
         
         # Get user information from profiles table
-        users_response = _supabase.table('profiles').select('id, full_name, phone_number, subscription_tier, created_at').execute()
-        users_df = pd.DataFrame(users_response.data)
+        users_response = _supabase.table('profiles').select('*').execute()
+        users_df = pd.DataFrame(users_response.data or [])
+        
+        # Ensure expected profile columns exist
+        for col in ['id', 'full_name', 'phone_number', 'subscription_tier', 'email']:
+            if col not in users_df.columns:
+                users_df[col] = None
+        
+        # Prefer email from Supabase Authentication users when available.
+        users_df['id'] = users_df['id'].astype(str)
+        auth_users_df = get_auth_users(_supabase)
+        if not auth_users_df.empty and {'id', 'email'}.issubset(auth_users_df.columns):
+            auth_email_map = auth_users_df.dropna(subset=['id']).drop_duplicates(subset=['id'], keep='first').set_index('id')['email']
+            users_df['email'] = users_df['id'].map(auth_email_map).fillna(users_df['email'])
         
         # Calculate duration from start_time and end_time if available (force UTC)
         if 'start_time' in trips_df.columns and 'end_time' in trips_df.columns:
@@ -145,7 +157,7 @@ def get_top_active_users(_supabase: Client, limit=10):
         user_stats = user_stats.merge(users_df, left_on='user_id', right_on='id', how='left')
         
         # Select and rename columns
-        user_stats = user_stats[['full_name', 'phone_number', 'subscription_tier', 'trip_count', 'trips_per_week', 
+        user_stats = user_stats[['full_name', 'email', 'phone_number', 'subscription_tier', 'trip_count', 'trips_per_week', 
                                  'total_distance', 'total_duration', 'days_since_last_trip']]
         
         # Sort by trip count and get top 10
@@ -792,6 +804,105 @@ def get_recent_trips(_supabase: Client, limit=20):
         st.error(f"Error fetching recent trips: {str(e)}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=300)
+def get_user_trip_completion(_supabase: Client):
+    """Get trip completion summary per user."""
+    try:
+        trips_response = _supabase.table('trips').select('user_id, status, created_at').execute()
+        trips_df = pd.DataFrame(trips_response.data or [])
+        
+        if trips_df.empty:
+            return pd.DataFrame(columns=[
+                'id', 'total_trips', 'completed_trips', 'completed_any_trip',
+                'first_trip_at', 'last_trip_at', 'first_completed_trip_at'
+            ])
+        
+        trips_df['user_id'] = trips_df['user_id'].astype(str)
+        trips_df['created_at'] = pd.to_datetime(trips_df['created_at'], errors='coerce', utc=True)
+        trips_df['status_norm'] = trips_df['status'].fillna('').astype(str).str.strip().str.lower()
+        
+        # Include the observed typo variant in your current data.
+        completed_statuses = {'completed', 'complated'}
+        trips_df['is_completed'] = trips_df['status_norm'].isin(completed_statuses)
+        
+        summary_df = trips_df.groupby('user_id').agg(
+            total_trips=('user_id', 'count'),
+            completed_trips=('is_completed', 'sum'),
+            first_trip_at=('created_at', 'min'),
+            last_trip_at=('created_at', 'max')
+        ).reset_index().rename(columns={'user_id': 'id'})
+        
+        first_completed_df = (
+            trips_df[trips_df['is_completed']]
+            .groupby('user_id')['created_at']
+            .min()
+            .reset_index()
+            .rename(columns={'user_id': 'id', 'created_at': 'first_completed_trip_at'})
+        )
+        
+        summary_df = summary_df.merge(first_completed_df, on='id', how='left')
+        summary_df['total_trips'] = summary_df['total_trips'].fillna(0).astype(int)
+        summary_df['completed_trips'] = summary_df['completed_trips'].fillna(0).astype(int)
+        summary_df['completed_any_trip'] = summary_df['completed_trips'] > 0
+        
+        return summary_df
+    except Exception as e:
+        st.error(f"Error fetching trip completion summary: {str(e)}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
+def get_auth_users(_supabase: Client):
+    """Get users directly from Supabase Authentication."""
+    try:
+        auth_users = []
+        page = 1
+        per_page = 1000
+        
+        while True:
+            users_batch = _supabase.auth.admin.list_users(page=page, per_page=per_page)
+            if not users_batch:
+                break
+            
+            for user in users_batch:
+                if hasattr(user, 'model_dump'):
+                    user = user.model_dump()
+                if not isinstance(user, dict):
+                    continue
+                
+                app_metadata = user.get('app_metadata') if isinstance(user.get('app_metadata'), dict) else {}
+                provider = app_metadata.get('provider')
+                if not provider:
+                    providers = app_metadata.get('providers')
+                    if isinstance(providers, list) and providers:
+                        provider = providers[0]
+                
+                auth_users.append({
+                    'id': str(user.get('id')) if user.get('id') else None,
+                    'email': user.get('email'),
+                    'phone': user.get('phone'),
+                    'provider': provider,
+                    'created_at': user.get('created_at'),
+                    'email_confirmed_at': user.get('email_confirmed_at') or user.get('confirmed_at'),
+                    'last_sign_in_at': user.get('last_sign_in_at')
+                })
+            
+            if len(users_batch) < per_page:
+                break
+            page += 1
+        
+        if not auth_users:
+            return pd.DataFrame()
+        
+        auth_users_df = pd.DataFrame(auth_users)
+        auth_users_df = auth_users_df.dropna(subset=['id']).drop_duplicates(subset=['id'], keep='first')
+        
+        for col in ['created_at', 'email_confirmed_at', 'last_sign_in_at']:
+            auth_users_df[col] = pd.to_datetime(auth_users_df[col], errors='coerce', utc=True)
+        
+        return auth_users_df
+    except Exception:
+        return pd.DataFrame()
+
 def main():
     # Header
     st.title("🚗 Mileage Tracker Pro Dashboard")
@@ -861,7 +972,7 @@ def main():
         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Main content area with tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics", "🆕 New Users"])
     
     with tab1:
         # Fetch key metrics
@@ -923,7 +1034,7 @@ def main():
                 display_df['days_since_last_trip'] = display_df['days_since_last_trip'].astype(int)
                 
                 # Rename columns for better display
-                display_df.columns = ['Name', 'Phone', 'Subscription', 'Total Trips', 'Trips/Week', 
+                display_df.columns = ['Name', 'Email', 'Phone', 'Subscription', 'Total Trips', 'Trips/Week', 
                                      'Total Distance (mi)', 'Total Duration', 'Days Since Last Trip']
                 
                 st.dataframe(
@@ -931,6 +1042,7 @@ def main():
                     use_container_width=True,
                     hide_index=True,
                     column_config={
+                        "Email": st.column_config.TextColumn(width="large"),
                         "Phone": st.column_config.TextColumn(width="medium"),
                         "Subscription": st.column_config.TextColumn(width="small"),
                         "Total Trips": st.column_config.NumberColumn(format="%d"),
@@ -2242,6 +2354,180 @@ def main():
 
         if st.button("🔄 Apply Filters", use_container_width=True):
             st.rerun()
+    
+    with tab9:
+        st.subheader("🆕 New Users from Authentication")
+        st.caption("Source: Supabase Auth Admin API (`auth.admin.list_users`)")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            new_user_days = st.selectbox(
+                "Registration window",
+                options=[7, 14, 30, 60, 90, 365],
+                index=2,
+                key="new_users_window_days"
+            )
+        with col2:
+            row_limit = st.selectbox(
+                "Max rows",
+                options=[25, 50, 100, 250, 500],
+                index=1,
+                key="new_users_row_limit"
+            )
+        with col3:
+            completion_filter = st.selectbox(
+                "Trip completion",
+                options=["All", "Completed at least one trip", "No completed trips yet"],
+                index=0,
+                key="new_users_completion_filter"
+            )
+        
+        auth_users_df = get_auth_users(supabase)
+        
+        if auth_users_df.empty:
+            st.warning("No authentication users found. Ensure `SUPABASE_KEY` is a service role key with Auth Admin access.")
+        else:
+            now_utc = pd.Timestamp.now(tz='UTC')
+            cutoff = now_utc - pd.Timedelta(days=new_user_days)
+            
+            new_users_df = auth_users_df[auth_users_df['created_at'] >= cutoff].copy()
+            new_users_df = new_users_df.sort_values('created_at', ascending=False)
+            
+            # Enrich with profile info for display context.
+            try:
+                profiles_response = supabase.table('profiles').select('id, full_name, subscription_tier').execute()
+                profiles_df = pd.DataFrame(profiles_response.data or [])
+                if not profiles_df.empty:
+                    profiles_df['id'] = profiles_df['id'].astype(str)
+                    new_users_df = new_users_df.merge(
+                        profiles_df[['id', 'full_name', 'subscription_tier']],
+                        on='id',
+                        how='left'
+                    )
+            except Exception:
+                pass
+            
+            # Enrich with trip completion summary.
+            trip_completion_df = get_user_trip_completion(supabase)
+            if not trip_completion_df.empty:
+                new_users_df = new_users_df.merge(
+                    trip_completion_df,
+                    on='id',
+                    how='left'
+                )
+            
+            for col in ['full_name', 'subscription_tier', 'total_trips', 'completed_trips',
+                        'completed_any_trip', 'first_trip_at', 'last_trip_at', 'first_completed_trip_at']:
+                if col not in new_users_df.columns:
+                    new_users_df[col] = None
+            
+            new_users_df['total_trips'] = pd.to_numeric(new_users_df['total_trips'], errors='coerce').fillna(0).astype(int)
+            new_users_df['completed_trips'] = pd.to_numeric(new_users_df['completed_trips'], errors='coerce').fillna(0).astype(int)
+            new_users_df['completed_any_trip'] = new_users_df['completed_any_trip'].fillna(False).astype(bool)
+            
+            # Summary metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("New Users", len(new_users_df), f"Last {new_user_days} days")
+            with col2:
+                verified_count = int(new_users_df['email_confirmed_at'].notna().sum())
+                st.metric("Email Verified", verified_count)
+            with col3:
+                active_recent = int((new_users_df['last_sign_in_at'] >= (now_utc - pd.Timedelta(days=30))).sum())
+                st.metric("Signed In (30d)", active_recent)
+            with col4:
+                completed_users = int(new_users_df['completed_any_trip'].sum())
+                completion_rate = (completed_users / len(new_users_df) * 100) if len(new_users_df) > 0 else 0
+                st.metric("Completed >=1 Trip", completed_users, f"{completion_rate:.1f}%")
+            with col5:
+                linked_profiles = int(new_users_df['full_name'].notna().sum())
+                st.metric("Linked Profiles", linked_profiles)
+            
+            # Optional completion filter for table view.
+            filtered_users_df = new_users_df.copy()
+            if completion_filter == "Completed at least one trip":
+                filtered_users_df = filtered_users_df[filtered_users_df['completed_any_trip']]
+            elif completion_filter == "No completed trips yet":
+                filtered_users_df = filtered_users_df[~filtered_users_df['completed_any_trip']]
+            
+            filtered_users_df = filtered_users_df.head(row_limit)
+            st.caption(f"Showing {len(filtered_users_df)} of {len(new_users_df)} users in the selected window.")
+            
+            st.markdown("---")
+            
+            # Daily signups chart
+            chart_df = new_users_df.dropna(subset=['created_at']).copy()
+            if not chart_df.empty:
+                chart_df['date'] = chart_df['created_at'].dt.date
+                daily_signups = chart_df.groupby('date').size().reset_index(name='new_users')
+                
+                fig = px.bar(
+                    daily_signups,
+                    x='date',
+                    y='new_users',
+                    title=f"Daily New Users ({new_user_days}-day window)",
+                    labels={'date': 'Date', 'new_users': 'New Users'}
+                )
+                fig.update_layout(showlegend=False, height=320)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # User detail table
+            st.markdown("#### New User Details")
+            display_df = filtered_users_df[[
+                'full_name', 'email', 'provider', 'created_at', 'completed_any_trip',
+                'completed_trips', 'total_trips', 'first_completed_trip_at',
+                'email_confirmed_at', 'last_sign_in_at', 'subscription_tier'
+            ]].copy()
+            display_df.rename(columns={
+                'full_name': 'Name',
+                'email': 'Email',
+                'provider': 'Provider',
+                'created_at': 'Registered At',
+                'completed_any_trip': 'Completed Trip?',
+                'completed_trips': 'Completed Trips',
+                'total_trips': 'Total Trips',
+                'first_completed_trip_at': 'First Completed Trip',
+                'email_confirmed_at': 'Email Confirmed At',
+                'last_sign_in_at': 'Last Sign In',
+                'subscription_tier': 'Subscription'
+            }, inplace=True)
+            
+            for dt_col in ['Registered At', 'First Completed Trip', 'Email Confirmed At', 'Last Sign In']:
+                display_df[dt_col] = pd.to_datetime(display_df[dt_col], errors='coerce', utc=True).dt.strftime('%Y-%m-%d %H:%M UTC')
+                display_df[dt_col] = display_df[dt_col].fillna('-')
+            
+            for num_col in ['Completed Trips', 'Total Trips']:
+                display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').fillna(0).astype(int)
+            
+            display_df['Completed Trip?'] = display_df['Completed Trip?'].map({True: 'Yes', False: 'No'}).fillna('No')
+            
+            for txt_col in ['Name', 'Email', 'Provider', 'Subscription']:
+                display_df[txt_col] = display_df[txt_col].fillna('-')
+            
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Email": st.column_config.TextColumn(width="large"),
+                    "Provider": st.column_config.TextColumn(width="small"),
+                    "Completed Trip?": st.column_config.TextColumn(width="small"),
+                    "Completed Trips": st.column_config.NumberColumn(format="%d"),
+                    "Total Trips": st.column_config.NumberColumn(format="%d"),
+                    "First Completed Trip": st.column_config.TextColumn(width="medium"),
+                    "Registered At": st.column_config.TextColumn(width="medium"),
+                    "Email Confirmed At": st.column_config.TextColumn(width="medium"),
+                    "Last Sign In": st.column_config.TextColumn(width="medium")
+                }
+            )
+            
+            csv = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "Download New Users CSV",
+                data=csv,
+                file_name=f"new_auth_users_last_{new_user_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
 
     # Footer
     st.markdown("---")
