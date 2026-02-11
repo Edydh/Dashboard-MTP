@@ -805,6 +805,74 @@ def get_recent_trips(_supabase: Client, limit=20):
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
+def get_trip_logs_with_users(_supabase: Client, lookback_days: int = 90):
+    """Get trip logs enriched with user information for day/week reporting."""
+    try:
+        cutoff_dt = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=lookback_days)
+        cutoff_date = cutoff_dt.isoformat()
+        
+        trips_response = _supabase.table('trips').select(
+            'id, user_id, created_at, status, start_location, end_location, purpose, mileage, actual_distance, start_time, end_time'
+        ).gte('created_at', cutoff_date).order('created_at', desc=True).execute()
+        
+        trips_df = pd.DataFrame(trips_response.data or [])
+        if trips_df.empty:
+            return pd.DataFrame()
+        
+        trips_df.rename(columns={'id': 'trip_id'}, inplace=True)
+        trips_df['user_id'] = trips_df['user_id'].astype(str)
+        trips_df['created_at'] = pd.to_datetime(trips_df['created_at'], errors='coerce', utc=True)
+        trips_df['start_time'] = pd.to_datetime(trips_df['start_time'], errors='coerce', utc=True)
+        trips_df['end_time'] = pd.to_datetime(trips_df['end_time'], errors='coerce', utc=True)
+        
+        trips_df['distance'] = pd.to_numeric(trips_df.get('actual_distance'), errors='coerce').fillna(
+            pd.to_numeric(trips_df.get('mileage'), errors='coerce')
+        ).fillna(0)
+        
+        trips_df['duration_mins'] = (
+            (trips_df['end_time'] - trips_df['start_time']).dt.total_seconds() / 60
+        ).fillna(0)
+        trips_df['duration_mins'] = trips_df['duration_mins'].clip(lower=0)
+        
+        trips_df['status'] = trips_df['status'].fillna('unknown')
+        status_norm = trips_df['status'].astype(str).str.strip().str.lower()
+        trips_df['is_completed'] = status_norm.isin({'completed', 'complated'})
+        
+        profiles_response = _supabase.table('profiles').select(
+            'id, full_name, phone_number, subscription_tier'
+        ).execute()
+        profiles_df = pd.DataFrame(profiles_response.data or [])
+        
+        if profiles_df.empty:
+            profiles_df = pd.DataFrame(columns=['profile_id', 'full_name', 'phone_number', 'subscription_tier'])
+        else:
+            profiles_df['id'] = profiles_df['id'].astype(str)
+            profiles_df.rename(columns={'id': 'profile_id'}, inplace=True)
+        
+        logs_df = trips_df.merge(
+            profiles_df[['profile_id', 'full_name', 'phone_number', 'subscription_tier']],
+            left_on='user_id',
+            right_on='profile_id',
+            how='left'
+        )
+        
+        auth_users_df = get_auth_users(_supabase)
+        if not auth_users_df.empty and {'id', 'email'}.issubset(auth_users_df.columns):
+            email_map = auth_users_df.dropna(subset=['id']).drop_duplicates(subset=['id'], keep='first').set_index('id')['email']
+            logs_df['email'] = logs_df['user_id'].map(email_map)
+        else:
+            logs_df['email'] = None
+        
+        return logs_df[[
+            'trip_id', 'user_id', 'created_at', 'status', 'is_completed',
+            'distance', 'duration_mins', 'start_location', 'end_location', 'purpose',
+            'full_name', 'email', 'phone_number', 'subscription_tier'
+        ]]
+    except Exception as e:
+        st.error(f"Error fetching trip logs: {str(e)}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
 def get_user_trip_completion(_supabase: Client):
     """Get trip completion summary per user."""
     try:
@@ -972,7 +1040,7 @@ def main():
         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Main content area with tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics", "🆕 New Users"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics", "🆕 New Users", "🗓️ Trip Logs"])
     
     with tab1:
         # Fetch key metrics
@@ -2526,6 +2594,212 @@ def main():
                 "Download New Users CSV",
                 data=csv,
                 file_name=f"new_auth_users_last_{new_user_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+    
+    with tab10:
+        st.subheader("🗓️ Trip Logs by Day or Week")
+        st.caption("Recent trip logs with user information, grouped by day or week.")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            trip_log_days = st.selectbox(
+                "Lookback window",
+                options=[7, 14, 30, 60, 90, 180, 365],
+                index=4,
+                key="trip_logs_lookback_days"
+            )
+        with col2:
+            trip_grouping = st.radio(
+                "Group trips by",
+                options=["Day", "Week"],
+                horizontal=True,
+                key="trip_logs_grouping"
+            )
+        with col3:
+            trip_log_limit = st.selectbox(
+                "Rows to show",
+                options=[25, 50, 100, 250, 500],
+                index=2,
+                key="trip_logs_row_limit"
+            )
+        
+        trip_logs_df = get_trip_logs_with_users(supabase, trip_log_days)
+        
+        if trip_logs_df.empty:
+            st.info("No trip logs found for the selected period.")
+        else:
+            logs_df = trip_logs_df.copy()
+            logs_df['created_at'] = pd.to_datetime(logs_df['created_at'], errors='coerce', utc=True)
+            logs_df['distance'] = pd.to_numeric(logs_df['distance'], errors='coerce').fillna(0)
+            logs_df['duration_mins'] = pd.to_numeric(logs_df['duration_mins'], errors='coerce').fillna(0)
+            logs_df['is_completed'] = logs_df['is_completed'].fillna(False).astype(bool)
+            
+            created_utc = logs_df['created_at'].dt.tz_convert('UTC')
+            if trip_grouping == "Day":
+                logs_df['period_start'] = created_utc.dt.floor('D')
+                logs_df['period_label'] = logs_df['period_start'].dt.strftime('%Y-%m-%d')
+            else:
+                logs_df['period_start'] = (created_utc - pd.to_timedelta(created_utc.dt.weekday, unit='D')).dt.floor('D')
+                logs_df['period_label'] = logs_df['period_start'].dt.strftime('Week of %Y-%m-%d')
+            
+            summary_df = logs_df.groupby(['period_start', 'period_label']).agg(
+                trips=('trip_id', 'count'),
+                unique_users=('user_id', 'nunique'),
+                completed_trips=('is_completed', 'sum'),
+                total_distance=('distance', 'sum')
+            ).reset_index()
+            summary_df['completion_rate'] = np.where(
+                summary_df['trips'] > 0,
+                (summary_df['completed_trips'] / summary_df['trips']) * 100,
+                0
+            )
+            summary_df = summary_df.sort_values('period_start', ascending=False)
+            summary_df['total_distance'] = summary_df['total_distance'].round(1)
+            summary_df['completion_rate'] = summary_df['completion_rate'].round(1)
+            
+            # Top-level KPI cards
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Trips Logged", f"{len(logs_df):,}", f"Last {trip_log_days} days")
+            with col2:
+                st.metric("Unique Users", f"{logs_df['user_id'].nunique():,}")
+            with col3:
+                st.metric("Completed Trips", f"{int(logs_df['is_completed'].sum()):,}")
+            with col4:
+                avg_trips_per_period = len(logs_df) / len(summary_df) if len(summary_df) > 0 else 0
+                st.metric(f"Avg Trips per {trip_grouping}", f"{avg_trips_per_period:.1f}")
+            
+            st.markdown("---")
+            
+            # Period summary chart + table
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                chart_df = summary_df.sort_values('period_start')
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=chart_df['period_label'],
+                    y=chart_df['trips'],
+                    name='Trips',
+                    marker_color='#1f77b4'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=chart_df['period_label'],
+                    y=chart_df['unique_users'],
+                    name='Unique Users',
+                    mode='lines+markers',
+                    yaxis='y2',
+                    line=dict(color='#ff7f0e', width=3)
+                ))
+                fig.update_layout(
+                    title=f"Trips and Unique Users by {trip_grouping}",
+                    xaxis_title=trip_grouping,
+                    yaxis=dict(title='Trips'),
+                    yaxis2=dict(title='Unique Users', overlaying='y', side='right'),
+                    height=360,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                st.markdown(f"#### {trip_grouping} Summary")
+                summary_display = summary_df[['period_label', 'trips', 'unique_users', 'completed_trips', 'completion_rate', 'total_distance']].copy()
+                summary_display.rename(columns={
+                    'period_label': trip_grouping,
+                    'trips': 'Trips',
+                    'unique_users': 'Users',
+                    'completed_trips': 'Completed',
+                    'completion_rate': 'Completion %',
+                    'total_distance': 'Distance (mi)'
+                }, inplace=True)
+                st.dataframe(
+                    summary_display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Trips": st.column_config.NumberColumn(format="%d"),
+                        "Users": st.column_config.NumberColumn(format="%d"),
+                        "Completed": st.column_config.NumberColumn(format="%d"),
+                        "Completion %": st.column_config.NumberColumn(format="%.1f"),
+                        "Distance (mi)": st.column_config.NumberColumn(format="%.1f")
+                    }
+                )
+            
+            st.markdown("---")
+            
+            # Detailed trip log table
+            period_options = ["All"] + summary_df['period_label'].tolist()
+            selected_period = st.selectbox(
+                f"Show detailed trips for {trip_grouping.lower()}",
+                options=period_options,
+                key="trip_logs_selected_period"
+            )
+            
+            details_df = logs_df.copy()
+            if selected_period != "All":
+                details_df = details_df[details_df['period_label'] == selected_period]
+            
+            details_df = details_df.sort_values('created_at', ascending=False).head(trip_log_limit)
+            
+            st.caption(f"Showing {len(details_df)} trip logs.")
+            
+            display_details = details_df[[
+                'created_at', 'trip_id', 'full_name', 'email', 'phone_number', 'subscription_tier',
+                'status', 'is_completed', 'distance', 'duration_mins', 'start_location', 'end_location', 'purpose'
+            ]].copy()
+            
+            display_details.rename(columns={
+                'created_at': 'Logged At',
+                'trip_id': 'Trip ID',
+                'full_name': 'User',
+                'email': 'Email',
+                'phone_number': 'Phone',
+                'subscription_tier': 'Subscription',
+                'status': 'Status',
+                'is_completed': 'Completed?',
+                'distance': 'Distance (mi)',
+                'duration_mins': 'Duration',
+                'start_location': 'Start Location',
+                'end_location': 'End Location',
+                'purpose': 'Purpose'
+            }, inplace=True)
+            
+            display_details['Logged At'] = pd.to_datetime(
+                display_details['Logged At'],
+                errors='coerce',
+                utc=True
+            ).dt.strftime('%Y-%m-%d %H:%M UTC').fillna('-')
+            display_details['Distance (mi)'] = pd.to_numeric(display_details['Distance (mi)'], errors='coerce').fillna(0).round(1)
+            display_details['Duration'] = pd.to_numeric(display_details['Duration'], errors='coerce').fillna(0).apply(format_duration)
+            display_details['Status'] = display_details['Status'].fillna('unknown').astype(str).str.title()
+            display_details['Completed?'] = display_details['Completed?'].map({True: 'Yes', False: 'No'}).fillna('No')
+            
+            for txt_col in ['User', 'Email', 'Phone', 'Subscription', 'Start Location', 'End Location', 'Purpose']:
+                display_details[txt_col] = display_details[txt_col].fillna('-')
+            
+            st.dataframe(
+                display_details,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Logged At": st.column_config.TextColumn(width="medium"),
+                    "Trip ID": st.column_config.TextColumn(width="small"),
+                    "User": st.column_config.TextColumn(width="medium"),
+                    "Email": st.column_config.TextColumn(width="large"),
+                    "Phone": st.column_config.TextColumn(width="medium"),
+                    "Subscription": st.column_config.TextColumn(width="small"),
+                    "Completed?": st.column_config.TextColumn(width="small"),
+                    "Distance (mi)": st.column_config.NumberColumn(format="%.1f"),
+                    "Start Location": st.column_config.TextColumn(width="large"),
+                    "End Location": st.column_config.TextColumn(width="large")
+                }
+            )
+            
+            csv_details = display_details.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "Download Trip Logs CSV",
+                data=csv_details,
+                file_name=f"trip_logs_{trip_grouping.lower()}_{trip_log_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
 
