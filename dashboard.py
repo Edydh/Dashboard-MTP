@@ -873,6 +873,121 @@ def get_trip_logs_with_users(_supabase: Client, lookback_days: int = 90):
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
+def get_upgrade_intent_events(_supabase: Client, lookback_days: int = 30):
+    """Get normalized, human-readable upgrade intent events."""
+    try:
+        cutoff_dt = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=lookback_days)
+        cutoff_date = cutoff_dt.isoformat()
+        
+        # Paginate to avoid default row limits in PostgREST.
+        all_events = []
+        page_size = 1000
+        offset = 0
+        max_rows = 20000
+        
+        while True:
+            response = _supabase.table('upgrade_intent_log').select(
+                'id, user_id, feature_name, timestamp, metadata'
+            ).gte('timestamp', cutoff_date).order('timestamp', desc=True).range(offset, offset + page_size - 1).execute()
+            
+            batch = response.data or []
+            if not batch:
+                break
+            
+            all_events.extend(batch)
+            if len(batch) < page_size:
+                break
+            
+            offset += page_size
+            if offset >= max_rows:
+                break
+        
+        events_df = pd.DataFrame(all_events)
+        if events_df.empty:
+            return pd.DataFrame()
+        
+        events_df['user_id'] = events_df['user_id'].astype(str)
+        events_df['event_ts'] = pd.to_datetime(events_df['timestamp'], errors='coerce', utc=True)
+        
+        # Flatten metadata keys used for analysis/display.
+        metadata_series = events_df['metadata'].apply(lambda m: m if isinstance(m, dict) else {})
+        events_df['meta_event_kind'] = metadata_series.apply(lambda m: m.get('event_kind'))
+        events_df['meta_event_name'] = metadata_series.apply(lambda m: m.get('event_name'))
+        events_df['meta_feature_name'] = metadata_series.apply(lambda m: m.get('feature_name'))
+        events_df['platform'] = metadata_series.apply(lambda m: m.get('platform'))
+        events_df['source'] = metadata_series.apply(lambda m: m.get('source'))
+        events_df['flow'] = metadata_series.apply(lambda m: m.get('flow'))
+        events_df['trip_id'] = metadata_series.apply(lambda m: m.get('trip_id'))
+        events_df['gate_strategy'] = metadata_series.apply(lambda m: m.get('gate_strategy'))
+        events_df['event_subscription_tier'] = metadata_series.apply(lambda m: m.get('subscription_tier'))
+        events_df['experiment_name'] = metadata_series.apply(lambda m: m.get('experiment_name'))
+        events_df['experiment_variant'] = metadata_series.apply(lambda m: m.get('experiment_variant'))
+        
+        # Parse feature_name patterns like conversion_event:premium_purchase_started.
+        parsed = events_df['feature_name'].astype(str).str.split(':', n=1, expand=True)
+        if parsed.shape[1] > 1:
+            events_df['event_kind'] = events_df['meta_event_kind'].fillna(parsed[0])
+            events_df['event_name'] = events_df['meta_event_name'].fillna(parsed[1])
+            events_df['parsed_feature'] = events_df['feature_name'].astype(str)
+            has_delimiter = events_df['feature_name'].astype(str).str.contains(':')
+            events_df.loc[has_delimiter, 'parsed_feature'] = parsed.loc[has_delimiter, 1]
+            events_df['feature_display'] = events_df['meta_feature_name'].combine_first(events_df['parsed_feature'])
+        else:
+            events_df['event_kind'] = events_df['meta_event_kind'].fillna('unknown')
+            events_df['event_name'] = events_df['meta_event_name'].fillna(events_df['feature_name'])
+            events_df['feature_display'] = events_df['meta_feature_name'].fillna(events_df['feature_name'])
+        
+        events_df['event_name'] = events_df['event_name'].fillna(events_df['feature_name'])
+        events_df['event_family'] = events_df['event_kind'].map({
+            'upgrade_intent': 'Upgrade Intent',
+            'conversion_event': 'Conversion Event'
+        }).fillna('Other')
+        events_df['action_label'] = events_df['event_name'].astype(str).str.replace('_', ' ', regex=False).str.strip().str.title()
+        
+        # Attach profile context.
+        profiles_response = _supabase.table('profiles').select(
+            'id, full_name, phone_number, subscription_tier'
+        ).execute()
+        profiles_df = pd.DataFrame(profiles_response.data or [])
+        if not profiles_df.empty:
+            profiles_df['id'] = profiles_df['id'].astype(str)
+            profiles_df.rename(columns={
+                'id': 'profile_id',
+                'subscription_tier': 'profile_subscription_tier'
+            }, inplace=True)
+            events_df = events_df.merge(
+                profiles_df[['profile_id', 'full_name', 'phone_number', 'profile_subscription_tier']],
+                left_on='user_id',
+                right_on='profile_id',
+                how='left'
+            )
+        else:
+            events_df['full_name'] = None
+            events_df['phone_number'] = None
+            events_df['profile_subscription_tier'] = None
+        
+        # Attach auth email.
+        auth_users_df = get_auth_users(_supabase)
+        if not auth_users_df.empty and {'id', 'email'}.issubset(auth_users_df.columns):
+            email_map = auth_users_df.dropna(subset=['id']).drop_duplicates(subset=['id'], keep='first').set_index('id')['email']
+            events_df['email'] = events_df['user_id'].map(email_map)
+        else:
+            events_df['email'] = None
+        
+        # Final readable tier field with event tier as first source.
+        events_df['subscription_tier'] = events_df['event_subscription_tier'].fillna(events_df['profile_subscription_tier'])
+        
+        return events_df[[
+            'id', 'event_ts', 'user_id', 'full_name', 'email', 'phone_number',
+            'event_family', 'event_kind', 'event_name', 'action_label',
+            'feature_display', 'source', 'platform', 'flow', 'trip_id',
+            'subscription_tier', 'gate_strategy', 'experiment_name', 'experiment_variant'
+        ]]
+    except Exception as e:
+        st.error(f"Error fetching upgrade intent events: {str(e)}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
 def get_user_trip_completion(_supabase: Client):
     """Get trip completion summary per user."""
     try:
@@ -1040,7 +1155,7 @@ def main():
         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Main content area with tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics", "🆕 New Users", "🗓️ Trip Logs"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics", "🆕 New Users", "🗓️ Trip Logs", "🚀 Upgrade Signals"])
     
     with tab1:
         # Fetch key metrics
@@ -2802,6 +2917,271 @@ def main():
                 file_name=f"trip_logs_{trip_grouping.lower()}_{trip_log_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
+    
+    with tab11:
+        st.subheader("🚀 Upgrade Intent Signals (Human Readable)")
+        st.caption("Source: `upgrade_intent_log` event stream with metadata normalized for analysis.")
+        
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            intent_lookback_days = st.selectbox(
+                "Lookback window",
+                options=[1, 7, 14, 30, 60, 90, 180],
+                index=3,
+                key="intent_lookback_days"
+            )
+        with col2:
+            intent_row_limit = st.selectbox(
+                "Rows to show",
+                options=[25, 50, 100, 250, 500, 1000],
+                index=2,
+                key="intent_row_limit"
+            )
+        
+        intent_df = get_upgrade_intent_events(supabase, intent_lookback_days)
+        
+        if intent_df.empty:
+            st.info("No upgrade intent events found for the selected period.")
+        else:
+            filtered_df = intent_df.copy()
+            
+            family_options = sorted(filtered_df['event_family'].dropna().astype(str).unique().tolist())
+            platform_options = sorted(filtered_df['platform'].dropna().astype(str).unique().tolist())
+            feature_options = sorted(filtered_df['feature_display'].dropna().astype(str).unique().tolist())
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                selected_families = st.multiselect(
+                    "Event families",
+                    options=family_options,
+                    default=family_options,
+                    key="intent_family_filter"
+                )
+            with col2:
+                selected_platforms = st.multiselect(
+                    "Platforms",
+                    options=platform_options,
+                    default=platform_options,
+                    key="intent_platform_filter"
+                )
+            with col3:
+                selected_features = st.multiselect(
+                    "Features",
+                    options=feature_options,
+                    default=feature_options,
+                    key="intent_feature_filter"
+                )
+            
+            if selected_families:
+                filtered_df = filtered_df[filtered_df['event_family'].isin(selected_families)]
+            if selected_platforms:
+                filtered_df = filtered_df[filtered_df['platform'].isin(selected_platforms)]
+            if selected_features:
+                filtered_df = filtered_df[filtered_df['feature_display'].isin(selected_features)]
+            
+            if filtered_df.empty:
+                st.info("No events match the selected filters.")
+            else:
+                filtered_df['event_ts'] = pd.to_datetime(filtered_df['event_ts'], errors='coerce', utc=True)
+                
+                # Core KPI row
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("Total Signals", f"{len(filtered_df):,}")
+                with col2:
+                    st.metric("Unique Users", f"{filtered_df['user_id'].nunique():,}")
+                with col3:
+                    st.metric("Upgrade Intent", f"{int((filtered_df['event_kind'] == 'upgrade_intent').sum()):,}")
+                with col4:
+                    st.metric("Conversion Events", f"{int((filtered_df['event_kind'] == 'conversion_event').sum()):,}")
+                with col5:
+                    purchase_started = int((filtered_df['event_name'] == 'premium_purchase_started').sum())
+                    st.metric("Purchase Starts", f"{purchase_started:,}")
+                
+                # Funnel-style summary for common conversion milestones.
+                purchase_start_users = int(filtered_df[filtered_df['event_name'] == 'premium_purchase_started']['user_id'].nunique())
+                purchase_complete_users = int(filtered_df[filtered_df['event_name'] == 'premium_purchase_completed']['user_id'].nunique())
+                export_attempts = int((filtered_df['event_name'] == 'trip_export_attempted').sum())
+                export_completes = int((filtered_df['event_name'] == 'trip_export_completed').sum())
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Purchase Start Users", f"{purchase_start_users:,}")
+                with col2:
+                    st.metric("Purchase Complete Users", f"{purchase_complete_users:,}")
+                with col3:
+                    purchase_rate = (purchase_complete_users / purchase_start_users * 100) if purchase_start_users > 0 else 0
+                    st.metric("Start → Complete Rate", f"{purchase_rate:.1f}%")
+                
+                st.caption(f"Trip Export Conversion: {export_completes:,} / {export_attempts:,} ({(export_completes / export_attempts * 100) if export_attempts > 0 else 0:.1f}%)")
+                
+                st.markdown("---")
+                
+                # Top trigger and action summaries
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### Top Features Triggering Upgrade Intent")
+                    trigger_df = filtered_df[filtered_df['event_kind'] == 'upgrade_intent']
+                    if not trigger_df.empty:
+                        top_features_df = trigger_df['feature_display'].fillna('Unknown').value_counts().head(10).reset_index()
+                        top_features_df.columns = ['Feature', 'Signals']
+                        fig = px.bar(
+                            top_features_df,
+                            x='Signals',
+                            y='Feature',
+                            orientation='h',
+                            title="Upgrade Intent by Feature",
+                            color='Signals',
+                            color_continuous_scale='Blues'
+                        )
+                        fig.update_layout(height=350, showlegend=False, yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No upgrade intent events in this filtered view.")
+                
+                with col2:
+                    st.markdown("#### Most Frequent Actions")
+                    top_actions_df = filtered_df['action_label'].fillna('Unknown').value_counts().head(10).reset_index()
+                    top_actions_df.columns = ['Action', 'Events']
+                    fig = px.bar(
+                        top_actions_df,
+                        x='Events',
+                        y='Action',
+                        orientation='h',
+                        title="Top Actions",
+                        color='Events',
+                        color_continuous_scale='Greens'
+                    )
+                    fig.update_layout(height=350, showlegend=False, yaxis={'categoryorder': 'total ascending'})
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Timeline chart
+                st.markdown("#### Event Timeline")
+                timeline_df = filtered_df.dropna(subset=['event_ts']).copy()
+                if not timeline_df.empty:
+                    if intent_lookback_days <= 7:
+                        timeline_df['time_bucket'] = timeline_df['event_ts'].dt.floor('H')
+                        timeline_title = "Hourly Event Volume"
+                    else:
+                        timeline_df['time_bucket'] = timeline_df['event_ts'].dt.floor('D')
+                        timeline_title = "Daily Event Volume"
+                    
+                    timeline_agg = timeline_df.groupby(['time_bucket', 'event_family']).size().reset_index(name='events')
+                    fig = px.line(
+                        timeline_agg,
+                        x='time_bucket',
+                        y='events',
+                        color='event_family',
+                        markers=True,
+                        title=timeline_title,
+                        labels={'time_bucket': 'Time', 'events': 'Events', 'event_family': 'Family'}
+                    )
+                    fig.update_layout(height=350)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No timestamped events available for timeline.")
+                
+                st.markdown("---")
+                
+                # User-level summary
+                st.markdown("#### User-Level Summary")
+                summary_df = filtered_df.copy()
+                summary_df['display_user'] = summary_df['full_name'].fillna(summary_df['user_id'].astype(str).str[:8] + '...')
+                user_summary = summary_df.groupby('user_id').agg(
+                    User=('display_user', 'first'),
+                    Email=('email', 'first'),
+                    Events=('id', 'count'),
+                    Upgrade_Intents=('event_kind', lambda x: int((x == 'upgrade_intent').sum())),
+                    Conversion_Events=('event_kind', lambda x: int((x == 'conversion_event').sum())),
+                    First_Signal=('event_ts', 'min'),
+                    Last_Signal=('event_ts', 'max')
+                ).reset_index(drop=True).sort_values('Events', ascending=False)
+                
+                user_summary.rename(columns={
+                    'Upgrade_Intents': 'Upgrade Intents',
+                    'Conversion_Events': 'Conversion Events',
+                    'First_Signal': 'First Signal',
+                    'Last_Signal': 'Last Signal'
+                }, inplace=True)
+                
+                user_summary['Email'] = user_summary['Email'].fillna('-')
+                for dt_col in ['First Signal', 'Last Signal']:
+                    user_summary[dt_col] = pd.to_datetime(user_summary[dt_col], errors='coerce', utc=True).dt.strftime('%Y-%m-%d %H:%M UTC').fillna('-')
+                
+                st.dataframe(
+                    user_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Events": st.column_config.NumberColumn(format="%d"),
+                        "Upgrade Intents": st.column_config.NumberColumn(format="%d"),
+                        "Conversion Events": st.column_config.NumberColumn(format="%d"),
+                    }
+                )
+                
+                st.markdown("---")
+                
+                # Detailed event feed
+                st.markdown("#### Event Feed")
+                detail_df = filtered_df.sort_values('event_ts', ascending=False).head(intent_row_limit).copy()
+                
+                def format_experiment(name, variant):
+                    if pd.isna(name) or str(name).strip() == "":
+                        return "-"
+                    if pd.notna(variant) and str(variant).strip() != "":
+                        return f"{name} ({variant})"
+                    return str(name)
+                
+                detail_df['Time (UTC)'] = pd.to_datetime(detail_df['event_ts'], errors='coerce', utc=True).dt.strftime('%Y-%m-%d %H:%M:%S').fillna('-')
+                detail_df['User'] = detail_df['full_name'].fillna(detail_df['user_id'].astype(str).str[:8] + '...')
+                detail_df['Email'] = detail_df['email'].fillna('-')
+                detail_df['Event Family'] = detail_df['event_family'].fillna('-')
+                detail_df['Action'] = detail_df['action_label'].fillna('-')
+                detail_df['Feature'] = detail_df['feature_display'].fillna('-')
+                detail_df['Source'] = detail_df['source'].fillna('-')
+                detail_df['Platform'] = detail_df['platform'].fillna('-')
+                detail_df['Subscription'] = detail_df['subscription_tier'].fillna('-')
+                detail_df['Gate Strategy'] = detail_df['gate_strategy'].fillna('-')
+                detail_df['Experiment'] = detail_df.apply(
+                    lambda r: format_experiment(r.get('experiment_name'), r.get('experiment_variant')),
+                    axis=1
+                )
+                detail_df['Trip ID'] = detail_df['trip_id'].fillna('-')
+                
+                display_cols = [
+                    'Time (UTC)', 'User', 'Email', 'Event Family', 'Action', 'Feature',
+                    'Source', 'Platform', 'Subscription', 'Gate Strategy', 'Experiment', 'Trip ID'
+                ]
+                display_feed = detail_df[display_cols].copy()
+                
+                st.caption(f"Showing {len(display_feed)} most recent events after filters.")
+                st.dataframe(
+                    display_feed,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Time (UTC)": st.column_config.TextColumn(width="medium"),
+                        "User": st.column_config.TextColumn(width="medium"),
+                        "Email": st.column_config.TextColumn(width="large"),
+                        "Event Family": st.column_config.TextColumn(width="small"),
+                        "Action": st.column_config.TextColumn(width="medium"),
+                        "Feature": st.column_config.TextColumn(width="medium"),
+                        "Source": st.column_config.TextColumn(width="medium"),
+                        "Platform": st.column_config.TextColumn(width="small"),
+                        "Subscription": st.column_config.TextColumn(width="small"),
+                        "Gate Strategy": st.column_config.TextColumn(width="small"),
+                        "Experiment": st.column_config.TextColumn(width="medium"),
+                        "Trip ID": st.column_config.TextColumn(width="medium"),
+                    }
+                )
+                
+                feed_csv = display_feed.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "Download Upgrade Signals CSV",
+                    data=feed_csv,
+                    file_name=f"upgrade_signals_{intent_lookback_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
 
     # Footer
     st.markdown("---")
