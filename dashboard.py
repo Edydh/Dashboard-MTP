@@ -1159,12 +1159,34 @@ def get_upgrade_intent_events(_supabase: Client, lookback_days: int = 30):
         st.error(f"Error fetching upgrade intent events: {str(e)}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=120)
 def get_user_trip_completion(_supabase: Client):
     """Get trip completion summary per user."""
     try:
-        trips_response = _supabase.table('trips').select('user_id, status, created_at').execute()
-        trips_df = pd.DataFrame(trips_response.data or [])
+        # Paginate to avoid PostgREST default row limits (e.g., 1000 rows).
+        all_trips = []
+        page_size = 1000
+        offset = 0
+        max_rows = 200000
+
+        while True:
+            trips_response = _supabase.table('trips').select(
+                'user_id, status, created_at'
+            ).order('created_at', desc=True).range(offset, offset + page_size - 1).execute()
+
+            batch = trips_response.data or []
+            if not batch:
+                break
+
+            all_trips.extend(batch)
+            if len(batch) < page_size:
+                break
+
+            offset += page_size
+            if offset >= max_rows:
+                break
+
+        trips_df = pd.DataFrame(all_trips)
         
         if trips_df.empty:
             return pd.DataFrame(columns=[
