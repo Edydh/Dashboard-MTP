@@ -728,6 +728,178 @@ def get_fuel_efficiency_analytics(_supabase: Client):
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
+def get_expense_analytics(_supabase: Client, lookback_days: int = 90):
+    """Build expense analysis dataset from user expense tables."""
+    try:
+        cutoff_dt = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=lookback_days)
+        cutoff_date = cutoff_dt.isoformat()
+        frames = []
+
+        def first_available(series_df: pd.DataFrame, candidates, default_value=''):
+            for col in candidates:
+                if col in series_df.columns:
+                    return series_df[col]
+            return pd.Series([default_value] * len(series_df), index=series_df.index)
+
+        # Gas expenses (amount is derived from quantity * unit_price).
+        try:
+            gas_resp = _supabase.table('gas_expenses').select(
+                'id, trip_id, user_id, created_at, date, quantity, unit_price, unit, vendor, place_name, notes, receipt_image_url'
+            ).gte('created_at', cutoff_date).execute()
+            gas_df = pd.DataFrame(gas_resp.data or [])
+            if not gas_df.empty:
+                gas_df['quantity'] = pd.to_numeric(gas_df.get('quantity', 0), errors='coerce').fillna(0)
+                gas_df['unit_price'] = pd.to_numeric(gas_df.get('unit_price', 0), errors='coerce').fillna(0)
+                gas_df['amount'] = gas_df['quantity'] * gas_df['unit_price']
+                gas_df['expense_type'] = 'Gas'
+                gas_df['expense_subtype'] = gas_df.get('unit', '-').fillna('-')
+                frames.append(gas_df)
+        except Exception:
+            pass
+
+        # Maintenance expenses (amount is stored directly).
+        try:
+            maintenance_resp = _supabase.table('maintenance_expenses').select(
+                'id, trip_id, user_id, created_at, date, type, amount, vendor, place_name, notes, receipt_image_url'
+            ).gte('created_at', cutoff_date).execute()
+            maintenance_df = pd.DataFrame(maintenance_resp.data or [])
+            if not maintenance_df.empty:
+                maintenance_df['amount'] = pd.to_numeric(maintenance_df.get('amount', 0), errors='coerce').fillna(0)
+                maintenance_df['expense_type'] = 'Maintenance'
+                maintenance_df['expense_subtype'] = maintenance_df.get('type', '-').fillna('-')
+                frames.append(maintenance_df)
+        except Exception:
+            pass
+
+        # Custom expenses (amount is stored directly).
+        try:
+            custom_resp = _supabase.table('custom_expenses').select(
+                'id, trip_id, user_id, created_at, date, name, amount, vendor, place_name, notes, receipt_image_url'
+            ).gte('created_at', cutoff_date).execute()
+            custom_df = pd.DataFrame(custom_resp.data or [])
+            if not custom_df.empty:
+                custom_df['amount'] = pd.to_numeric(custom_df.get('amount', 0), errors='coerce').fillna(0)
+                custom_df['expense_type'] = 'Custom'
+                custom_df['expense_subtype'] = custom_df.get('name', '-').fillna('-')
+                frames.append(custom_df)
+        except Exception:
+            pass
+
+        # Trip expenses (schema can vary; normalize dynamically).
+        try:
+            trip_resp = _supabase.table('trip_expenses').select('*').gte('created_at', cutoff_date).execute()
+            trip_df = pd.DataFrame(trip_resp.data or [])
+            if not trip_df.empty:
+                trip_df['amount'] = pd.to_numeric(
+                    first_available(trip_df, ['amount', 'expense_amount', 'total_amount', 'cost', 'price'], 0),
+                    errors='coerce'
+                ).fillna(0)
+
+                if 'quantity' in trip_df.columns and 'unit_price' in trip_df.columns:
+                    derived_amount = pd.to_numeric(trip_df['quantity'], errors='coerce').fillna(0) * pd.to_numeric(
+                        trip_df['unit_price'], errors='coerce'
+                    ).fillna(0)
+                    trip_df['amount'] = np.where(trip_df['amount'] > 0, trip_df['amount'], derived_amount)
+
+                trip_df['expense_type'] = 'Trip'
+                trip_df['expense_subtype'] = first_available(
+                    trip_df,
+                    ['type', 'name', 'category', 'expense_type', 'description'],
+                    'Trip Expense'
+                ).fillna('Trip Expense')
+                trip_df['vendor'] = first_available(trip_df, ['vendor', 'merchant', 'vendor_name'], '-').fillna('-')
+                trip_df['place_name'] = first_available(
+                    trip_df,
+                    ['place_name', 'location', 'location_name', 'address'],
+                    '-'
+                ).fillna('-')
+                trip_df['notes'] = first_available(trip_df, ['notes', 'note', 'description'], '').fillna('')
+                trip_df['receipt_image_url'] = first_available(
+                    trip_df,
+                    ['receipt_image_url', 'receipt_url', 'image_url'],
+                    ''
+                ).fillna('')
+
+                if 'user_id' not in trip_df.columns:
+                    trip_df['user_id'] = ''
+
+                # Fill missing user_id via trips table when only trip_id is present.
+                trip_df['user_id'] = trip_df['user_id'].fillna('').astype(str)
+                if 'trip_id' in trip_df.columns:
+                    missing_user_mask = trip_df['user_id'].str.strip() == ''
+                    missing_trip_ids = trip_df.loc[missing_user_mask, 'trip_id'].dropna().astype(str).unique().tolist()
+                    if missing_trip_ids:
+                        try:
+                            trip_user_resp = _supabase.table('trips').select('id, user_id').in_('id', missing_trip_ids).execute()
+                            trip_user_rows = trip_user_resp.data or []
+                            if trip_user_rows:
+                                trip_user_map = {
+                                    str(row['id']): str(row.get('user_id', ''))
+                                    for row in trip_user_rows
+                                    if row.get('id') is not None
+                                }
+                                trip_df.loc[missing_user_mask, 'user_id'] = trip_df.loc[missing_user_mask, 'trip_id'].astype(str).map(trip_user_map).fillna('')
+                        except Exception:
+                            pass
+
+                frames.append(trip_df)
+        except Exception:
+            pass
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True, sort=False)
+        df['created_at'] = pd.to_datetime(df.get('created_at'), errors='coerce', utc=True)
+        df['expense_date'] = pd.to_datetime(df.get('date', df['created_at']), errors='coerce', utc=True)
+        df['amount'] = pd.to_numeric(df.get('amount', 0), errors='coerce').fillna(0)
+        df['trip_id'] = df.get('trip_id', '').fillna('').astype(str)
+        df['user_id'] = df.get('user_id', '').fillna('').astype(str)
+        df['vendor'] = df.get('vendor', '-').fillna('-').astype(str)
+        df['place_name'] = df.get('place_name', '-').fillna('-').astype(str)
+        df['notes'] = df.get('notes', '').fillna('').astype(str)
+        df['receipt_image_url'] = df.get('receipt_image_url', '').fillna('').astype(str)
+        df['expense_subtype'] = df.get('expense_subtype', '-').fillna('-').astype(str)
+        df['has_receipt'] = df['receipt_image_url'].str.strip() != ''
+        df['amount'] = df['amount'].clip(lower=0)
+
+        # Enrich with user profile context.
+        try:
+            profiles_response = _supabase.table('profiles').select('id, full_name, subscription_tier').execute()
+            profiles_df = pd.DataFrame(profiles_response.data or [])
+            if not profiles_df.empty:
+                profiles_df = profiles_df.rename(columns={'id': 'profile_id'})
+                profiles_df['profile_id'] = profiles_df['profile_id'].astype(str)
+                df = df.merge(
+                    profiles_df[['profile_id', 'full_name', 'subscription_tier']],
+                    left_on='user_id',
+                    right_on='profile_id',
+                    how='left'
+                )
+                df.drop(columns=['profile_id'], inplace=True, errors='ignore')
+        except Exception:
+            pass
+
+        if 'full_name' not in df.columns:
+            df['full_name'] = ''
+        if 'subscription_tier' not in df.columns:
+            df['subscription_tier'] = '-'
+
+        df['full_name'] = df['full_name'].fillna('')
+        df['subscription_tier'] = df['subscription_tier'].fillna('-')
+        df['user_display'] = df['full_name'].where(
+            df['full_name'].astype(str).str.strip() != '',
+            np.where(df['user_id'].str.strip() != '', df['user_id'].str[:8] + '...', 'Unknown User')
+        )
+
+        # Stable sort for display and charts.
+        df = df.sort_values('created_at', ascending=False).reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching expense analytics: {str(e)}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
 def get_global_destinations(_supabase: Client):
     """Get all global destinations with usage statistics"""
     try:
@@ -1155,7 +1327,20 @@ def main():
         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Main content area with tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["📊 Overview", "💰 Revenue", "📈 Growth", "🔴 Live Feed", "👥 Users", "📈 Retention", "🗺️ Destinations Map", "🔧 Advanced Analytics", "🆕 New Users", "🗓️ Trip Logs", "🚀 Upgrade Signals"])
+    tab1, tab2, tab12, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+        "📊 Overview",
+        "💰 Revenue",
+        "💸 Expenses",
+        "📈 Growth",
+        "🔴 Live Feed",
+        "👥 Users",
+        "📈 Retention",
+        "🗺️ Destinations Map",
+        "🔧 Advanced Analytics",
+        "🆕 New Users",
+        "🗓️ Trip Logs",
+        "🚀 Upgrade Signals"
+    ])
     
     with tab1:
         # Fetch key metrics
@@ -3180,6 +3365,264 @@ def main():
                     "Download Upgrade Signals CSV",
                     data=feed_csv,
                     file_name=f"upgrade_signals_{intent_lookback_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+    
+    with tab12:
+        st.subheader("💸 Expense Analysis")
+        st.caption("Source: user-entered records in `gas_expenses`, `maintenance_expenses`, `custom_expenses`, and `trip_expenses`.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            expense_lookback_days = st.selectbox(
+                "Lookback window",
+                options=[7, 14, 30, 60, 90, 180, 365],
+                index=4,
+                key="expense_lookback_days"
+            )
+        with col2:
+            expense_row_limit = st.selectbox(
+                "Rows to show",
+                options=[25, 50, 100, 250, 500, 1000],
+                index=2,
+                key="expense_row_limit"
+            )
+        
+        expense_df = get_expense_analytics(supabase, expense_lookback_days)
+        
+        if expense_df.empty:
+            st.info("No expense data found for the selected period.")
+        else:
+            filtered_expense_df = expense_df.copy()
+            type_options = sorted(filtered_expense_df['expense_type'].dropna().astype(str).unique().tolist())
+            tier_options = sorted(filtered_expense_df['subscription_tier'].dropna().astype(str).unique().tolist())
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                selected_types = st.multiselect(
+                    "Expense type filter",
+                    options=type_options,
+                    default=type_options,
+                    key="expense_type_filter"
+                )
+            with col2:
+                selected_tiers = st.multiselect(
+                    "Subscription filter",
+                    options=tier_options,
+                    default=tier_options,
+                    key="expense_tier_filter"
+                )
+            with col3:
+                receipt_filter = st.selectbox(
+                    "Receipt filter",
+                    options=["All", "With receipt", "Without receipt"],
+                    index=0,
+                    key="expense_receipt_filter"
+                )
+            
+            if selected_types:
+                filtered_expense_df = filtered_expense_df[filtered_expense_df['expense_type'].isin(selected_types)]
+            if selected_tiers:
+                filtered_expense_df = filtered_expense_df[filtered_expense_df['subscription_tier'].isin(selected_tiers)]
+            if receipt_filter == "With receipt":
+                filtered_expense_df = filtered_expense_df[filtered_expense_df['has_receipt']]
+            elif receipt_filter == "Without receipt":
+                filtered_expense_df = filtered_expense_df[~filtered_expense_df['has_receipt']]
+            
+            if filtered_expense_df.empty:
+                st.info("No expense records match the selected filters.")
+            else:
+                total_records = len(filtered_expense_df)
+                total_amount = float(filtered_expense_df['amount'].sum())
+                unique_users = int(filtered_expense_df['user_id'].replace('', pd.NA).dropna().nunique())
+                avg_expense_per_record = (total_amount / total_records) if total_records > 0 else 0
+                receipt_count = int(filtered_expense_df['has_receipt'].sum())
+                receipt_pct = (receipt_count / total_records * 100) if total_records > 0 else 0
+                
+                type_totals = filtered_expense_df.groupby('expense_type')['amount'].sum()
+                gas_total = float(type_totals.get('Gas', 0))
+                maintenance_total = float(type_totals.get('Maintenance', 0))
+                custom_total = float(type_totals.get('Custom', 0))
+                trip_total = float(type_totals.get('Trip', 0))
+                
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("Expense Records", f"{total_records:,}", f"Last {expense_lookback_days} days")
+                with col2:
+                    st.metric("Total Expense", f"${total_amount:,.2f}")
+                with col3:
+                    st.metric("Unique Users", f"{unique_users:,}")
+                with col4:
+                    st.metric("Avg / Record", f"${avg_expense_per_record:,.2f}")
+                with col5:
+                    st.metric("Receipts", f"{receipt_count:,}", f"{receipt_pct:.1f}%")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    gas_share = (gas_total / total_amount * 100) if total_amount > 0 else 0
+                    st.metric("Gas Expenses", f"${gas_total:,.2f}", f"{gas_share:.1f}%")
+                with col2:
+                    maintenance_share = (maintenance_total / total_amount * 100) if total_amount > 0 else 0
+                    st.metric("Maintenance Expenses", f"${maintenance_total:,.2f}", f"{maintenance_share:.1f}%")
+                with col3:
+                    custom_share = (custom_total / total_amount * 100) if total_amount > 0 else 0
+                    st.metric("Custom Expenses", f"${custom_total:,.2f}", f"{custom_share:.1f}%")
+                with col4:
+                    trip_share = (trip_total / total_amount * 100) if total_amount > 0 else 0
+                    st.metric("Trip Expenses", f"${trip_total:,.2f}", f"{trip_share:.1f}%")
+                
+                st.markdown("---")
+                
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.markdown("#### Expense Trend")
+                    trend_df = filtered_expense_df.copy()
+                    trend_df['period'] = trend_df['expense_date'].fillna(trend_df['created_at']).dt.floor('D')
+                    trend_agg = trend_df.groupby(['period', 'expense_type']).agg(
+                        Amount=('amount', 'sum')
+                    ).reset_index().sort_values('period')
+                    
+                    fig = px.bar(
+                        trend_agg,
+                        x='period',
+                        y='Amount',
+                        color='expense_type',
+                        barmode='stack',
+                        title="Daily Expense Totals by Type",
+                        labels={'period': 'Date', 'Amount': 'Expense ($)', 'expense_type': 'Type'},
+                        color_discrete_sequence=px.colors.qualitative.Set2
+                    )
+                    fig.update_layout(height=360)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    st.markdown("#### Type Summary")
+                    type_summary = filtered_expense_df.groupby('expense_type').agg(
+                        Records=('expense_type', 'size'),
+                        Total=('amount', 'sum'),
+                        Average=('amount', 'mean'),
+                        Receipts=('has_receipt', 'sum')
+                    ).reset_index().sort_values('Total', ascending=False)
+                    type_summary['Total'] = type_summary['Total'].round(2)
+                    type_summary['Average'] = type_summary['Average'].round(2)
+                    type_summary.rename(columns={'expense_type': 'Type'}, inplace=True)
+                    
+                    st.dataframe(
+                        type_summary,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Records": st.column_config.NumberColumn(format="%d"),
+                            "Total": st.column_config.NumberColumn(format="$%.2f"),
+                            "Average": st.column_config.NumberColumn(format="$%.2f"),
+                            "Receipts": st.column_config.NumberColumn(format="%d")
+                        }
+                    )
+                
+                st.markdown("---")
+                
+                user_summary = filtered_expense_df.groupby(
+                    ['user_id', 'user_display', 'subscription_tier']
+                ).agg(
+                    Records=('user_id', 'size'),
+                    Total_Expense=('amount', 'sum'),
+                    Avg_Expense=('amount', 'mean'),
+                    Receipts=('has_receipt', 'sum')
+                ).reset_index()
+                user_summary['Share_Pct'] = np.where(
+                    total_amount > 0,
+                    (user_summary['Total_Expense'] / total_amount) * 100,
+                    0
+                )
+                top_users = user_summary.sort_values('Total_Expense', ascending=False).head(10)
+                
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.markdown("#### Top Users by Expense")
+                    if not top_users.empty:
+                        fig = px.bar(
+                            top_users,
+                            x='Total_Expense',
+                            y='user_display',
+                            orientation='h',
+                            title="Top 10 Users by Total Expense",
+                            labels={'Total_Expense': 'Total Expense ($)', 'user_display': 'User'},
+                            color='Total_Expense',
+                            color_continuous_scale='OrRd'
+                        )
+                        fig.update_layout(height=360, showlegend=False, yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No user expense data available.")
+                
+                with col2:
+                    top_users_display = top_users.copy()
+                    top_users_display['Total Expense'] = top_users_display['Total_Expense'].round(2)
+                    top_users_display['Avg Expense'] = top_users_display['Avg_Expense'].round(2)
+                    top_users_display['Share %'] = top_users_display['Share_Pct'].round(1)
+                    top_users_display = top_users_display[[
+                        'user_display', 'subscription_tier', 'Records', 'Total Expense', 'Avg Expense', 'Receipts', 'Share %'
+                    ]]
+                    top_users_display.rename(columns={
+                        'user_display': 'User',
+                        'subscription_tier': 'Tier'
+                    }, inplace=True)
+                    
+                    st.dataframe(
+                        top_users_display,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Records": st.column_config.NumberColumn(format="%d"),
+                            "Total Expense": st.column_config.NumberColumn(format="$%.2f"),
+                            "Avg Expense": st.column_config.NumberColumn(format="$%.2f"),
+                            "Receipts": st.column_config.NumberColumn(format="%d"),
+                            "Share %": st.column_config.NumberColumn(format="%.1f")
+                        }
+                    )
+                
+                st.markdown("---")
+                
+                st.markdown("#### Expense Records")
+                detail_df = filtered_expense_df.sort_values('created_at', ascending=False).head(expense_row_limit).copy()
+                detail_df['Created At (UTC)'] = pd.to_datetime(detail_df['created_at'], errors='coerce', utc=True).dt.strftime('%Y-%m-%d %H:%M')
+                detail_df['Expense Date (UTC)'] = pd.to_datetime(detail_df['expense_date'], errors='coerce', utc=True).dt.strftime('%Y-%m-%d')
+                detail_df['User'] = detail_df['user_display'].fillna('-')
+                detail_df['Tier'] = detail_df['subscription_tier'].fillna('-')
+                detail_df['Type'] = detail_df['expense_type'].fillna('-')
+                detail_df['Category'] = detail_df['expense_subtype'].fillna('-')
+                detail_df['Amount ($)'] = pd.to_numeric(detail_df['amount'], errors='coerce').fillna(0).round(2)
+                detail_df['Vendor'] = detail_df['vendor'].replace('', '-').fillna('-')
+                detail_df['Location'] = detail_df['place_name'].replace('', '-').fillna('-')
+                detail_df['Trip ID'] = detail_df['trip_id'].replace('', '-').fillna('-')
+                detail_df['Receipt'] = detail_df['has_receipt'].map({True: 'Yes', False: 'No'})
+                detail_df['Notes'] = detail_df['notes'].replace('', '-').fillna('-')
+                
+                display_cols = [
+                    'Created At (UTC)', 'Expense Date (UTC)', 'User', 'Tier', 'Type', 'Category',
+                    'Amount ($)', 'Vendor', 'Location', 'Trip ID', 'Receipt', 'Notes'
+                ]
+                display_details = detail_df[display_cols].copy()
+                
+                st.caption(f"Showing {len(display_details)} records.")
+                st.dataframe(
+                    display_details,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Amount ($)": st.column_config.NumberColumn(format="$%.2f"),
+                        "Vendor": st.column_config.TextColumn(width="medium"),
+                        "Location": st.column_config.TextColumn(width="large"),
+                        "Trip ID": st.column_config.TextColumn(width="medium"),
+                        "Notes": st.column_config.TextColumn(width="large")
+                    }
+                )
+                
+                expense_csv = display_details.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "Download Expense CSV",
+                    data=expense_csv,
+                    file_name=f"expense_analysis_{expense_lookback_days}d_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
                 )
 
