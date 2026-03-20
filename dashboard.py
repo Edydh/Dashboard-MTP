@@ -123,11 +123,12 @@ def get_top_active_users(_supabase: Client, limit=10):
         
         # Calculate duration from start_time and end_time if available (force UTC)
         if 'start_time' in trips_df.columns and 'end_time' in trips_df.columns:
-            trips_df['start_time'] = pd.to_datetime(trips_df['start_time'], errors='coerce', utc=True)
-            trips_df['end_time'] = pd.to_datetime(trips_df['end_time'], errors='coerce', utc=True)
-            trips_df['duration'] = (trips_df['end_time'] - trips_df['start_time']).dt.total_seconds() / 60  # Duration in minutes
+            trips_df['duration'] = calculate_trip_duration_minutes(
+                trips_df['start_time'],
+                trips_df['end_time']
+            )
         else:
-            trips_df['duration'] = 0
+            trips_df['duration'] = np.nan
         
         # Use actual_distance if available, otherwise use mileage
         trips_df['distance'] = trips_df['actual_distance'].fillna(trips_df['mileage']).fillna(0)
@@ -206,11 +207,12 @@ def get_trip_statistics(_supabase: Client):
  
         # Calculate duration from start_time and end_time if available
         if 'start_time' in df.columns and 'end_time' in df.columns:
-            df['start_time'] = pd.to_datetime(df['start_time'], errors='coerce', utc=True)
-            df['end_time'] = pd.to_datetime(df['end_time'], errors='coerce', utc=True)
-            df['duration'] = (df['end_time'] - df['start_time']).dt.total_seconds() / 60  # Duration in minutes
+            df['duration'] = calculate_trip_duration_minutes(
+                df['start_time'],
+                df['end_time']
+            )
         else:
-            df['duration'] = 0
+            df['duration'] = np.nan
  
         # Use actual_distance if available, otherwise use mileage
         df['distance'] = df['actual_distance'].fillna(df['mileage']).fillna(0)
@@ -503,11 +505,24 @@ def format_duration(minutes):
     """Format duration from minutes to readable format"""
     if pd.isna(minutes):
         return "N/A"
+    if 0 < minutes < 1:
+        return "<1m"
     hours = int(minutes // 60)
     mins = int(minutes % 60)
     if hours > 0:
         return f"{hours}h {mins}m"
     return f"{mins}m"
+
+def parse_mixed_timestamp_series(values, utc=True):
+    """Parse timestamp columns that mix fractional and non-fractional ISO strings."""
+    return pd.to_datetime(values, errors='coerce', utc=utc, format='mixed')
+
+def calculate_trip_duration_minutes(start_values, end_values):
+    """Calculate trip duration in minutes and leave unresolved/non-positive values empty."""
+    start_times = parse_mixed_timestamp_series(start_values, utc=True)
+    end_times = parse_mixed_timestamp_series(end_values, utc=True)
+    duration_minutes = (end_times - start_times).dt.total_seconds() / 60
+    return duration_minutes.where(duration_minutes > 0)
 
 def calculate_data_completeness(df):
     """Calculate overall data completeness score"""
@@ -994,17 +1009,17 @@ def get_trip_logs_with_users(_supabase: Client, lookback_days: int = 90):
         trips_df.rename(columns={'id': 'trip_id'}, inplace=True)
         trips_df['user_id'] = trips_df['user_id'].astype(str)
         trips_df['created_at'] = pd.to_datetime(trips_df['created_at'], errors='coerce', utc=True)
-        trips_df['start_time'] = pd.to_datetime(trips_df['start_time'], errors='coerce', utc=True)
-        trips_df['end_time'] = pd.to_datetime(trips_df['end_time'], errors='coerce', utc=True)
+        trips_df['start_time'] = parse_mixed_timestamp_series(trips_df['start_time'], utc=True)
+        trips_df['end_time'] = parse_mixed_timestamp_series(trips_df['end_time'], utc=True)
         
         trips_df['distance'] = pd.to_numeric(trips_df.get('actual_distance'), errors='coerce').fillna(
             pd.to_numeric(trips_df.get('mileage'), errors='coerce')
         ).fillna(0)
         
-        trips_df['duration_mins'] = (
-            (trips_df['end_time'] - trips_df['start_time']).dt.total_seconds() / 60
-        ).fillna(0)
-        trips_df['duration_mins'] = trips_df['duration_mins'].clip(lower=0)
+        trips_df['duration_mins'] = calculate_trip_duration_minutes(
+            trips_df['start_time'],
+            trips_df['end_time']
+        )
         
         trips_df['status'] = trips_df['status'].fillna('unknown')
         status_norm = trips_df['status'].astype(str).str.strip().str.lower()
@@ -2954,7 +2969,7 @@ def main():
             logs_df = trip_logs_df.copy()
             logs_df['created_at'] = pd.to_datetime(logs_df['created_at'], errors='coerce', utc=True)
             logs_df['distance'] = pd.to_numeric(logs_df['distance'], errors='coerce').fillna(0)
-            logs_df['duration_mins'] = pd.to_numeric(logs_df['duration_mins'], errors='coerce').fillna(0)
+            logs_df['duration_mins'] = pd.to_numeric(logs_df['duration_mins'], errors='coerce')
             logs_df['is_completed'] = logs_df['is_completed'].fillna(False).astype(bool)
             
             created_utc = logs_df['created_at'].dt.tz_convert('UTC')
@@ -3092,7 +3107,7 @@ def main():
                 utc=True
             ).dt.strftime('%Y-%m-%d %H:%M UTC').fillna('-')
             display_details['Distance (mi)'] = pd.to_numeric(display_details['Distance (mi)'], errors='coerce').fillna(0).round(1)
-            display_details['Duration'] = pd.to_numeric(display_details['Duration'], errors='coerce').fillna(0).apply(format_duration)
+            display_details['Duration'] = pd.to_numeric(display_details['Duration'], errors='coerce').apply(format_duration)
             display_details['Status'] = display_details['Status'].fillna('unknown').astype(str).str.title()
             display_details['Completed?'] = display_details['Completed?'].map({True: 'Yes', False: 'No'}).fillna('No')
             
