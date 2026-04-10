@@ -74,6 +74,63 @@ def get_total_users(_supabase: Client):
         return 0
 
 @st.cache_data(ttl=300)
+def get_trip_count(_supabase: Client, days=None):
+    """Get trip count, optionally limited to the last N days."""
+    try:
+        query = _supabase.table('trips').select('id', count='exact')
+        if days is not None:
+            cutoff_date = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)).isoformat()
+            query = query.gte('created_at', cutoff_date)
+
+        response = query.execute()
+        return int(response.count or 0)
+    except Exception as e:
+        st.error(f"Error fetching trip count: {str(e)}")
+        return 0
+
+@st.cache_data(ttl=300)
+def get_power_user_count(_supabase: Client, min_trips: int = 10):
+    """Count users whose total trip count exceeds the power-user threshold."""
+    try:
+        trips_df = get_trips_dataframe(_supabase, 'user_id, created_at')
+        if trips_df.empty:
+            return 0
+
+        trip_counts = trips_df.groupby('user_id').size()
+        return int((trip_counts > min_trips).sum())
+    except Exception as e:
+        st.error(f"Error fetching power user count: {str(e)}")
+        return 0
+
+@st.cache_data(ttl=300)
+def get_trips_dataframe(_supabase: Client, columns: str, created_at_gte=None):
+    """Fetch all trips for the requested columns using pagination."""
+    try:
+        all_rows = []
+        page_size = 1000
+        start = 0
+
+        while True:
+            query = _supabase.table('trips').select(columns).order('created_at', desc=False)
+            if created_at_gte is not None:
+                query = query.gte('created_at', created_at_gte)
+
+            batch = query.range(start, start + page_size - 1).execute().data or []
+            if not batch:
+                break
+
+            all_rows.extend(batch)
+            if len(batch) < page_size:
+                break
+
+            start += page_size
+
+        return pd.DataFrame(all_rows)
+    except Exception as e:
+        st.error(f"Error fetching trip data: {str(e)}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
 def get_active_users(_supabase: Client, days=30):
     """Get active users in the last N days"""
     try:
@@ -81,11 +138,10 @@ def get_active_users(_supabase: Client, days=30):
         cutoff_dt = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
         cutoff_date = cutoff_dt.isoformat()
         
-        # Query trips table for active users
-        response = _supabase.table('trips').select('user_id').gte('created_at', cutoff_date).execute()
-        
-        if response.data:
-            active_users = set(trip['user_id'] for trip in response.data)
+        trips_df = get_trips_dataframe(_supabase, 'user_id, created_at', created_at_gte=cutoff_date)
+
+        if not trips_df.empty:
+            active_users = set(trips_df['user_id'].dropna().astype(str))
             return len(active_users)
         return 0
     except Exception as e:
@@ -96,14 +152,13 @@ def get_active_users(_supabase: Client, days=30):
 def get_top_active_users(_supabase: Client, limit=10):
     """Get top 10 most active users with their statistics"""
     try:
-        # Get all trips with user information
-        trips_response = _supabase.table('trips').select('user_id, created_at, mileage, actual_distance, start_time, end_time').execute()
-        
-        if not trips_response.data:
+        trips_df = get_trips_dataframe(
+            _supabase,
+            'user_id, created_at, mileage, actual_distance, start_time, end_time'
+        )
+
+        if trips_df.empty:
             return pd.DataFrame()
-        
-        # Convert to DataFrame
-        trips_df = pd.DataFrame(trips_response.data)
         
         # Get user information from profiles table
         users_response = _supabase.table('profiles').select('*').execute()
@@ -131,7 +186,9 @@ def get_top_active_users(_supabase: Client, limit=10):
             trips_df['duration'] = np.nan
         
         # Use actual_distance if available, otherwise use mileage
-        trips_df['distance'] = trips_df['actual_distance'].fillna(trips_df['mileage']).fillna(0)
+        trips_df['distance'] = pd.to_numeric(trips_df.get('actual_distance'), errors='coerce').fillna(
+            pd.to_numeric(trips_df.get('mileage'), errors='coerce')
+        ).fillna(0)
         
         # Calculate statistics per user
         user_stats = trips_df.groupby('user_id').agg({
@@ -176,12 +233,11 @@ def get_usage_patterns(_supabase: Client):
     try:
         # Get trips from last 30 days
         cutoff_date = (datetime.now() - timedelta(days=30)).isoformat()
-        response = _supabase.table('trips').select('created_at, user_id').gte('created_at', cutoff_date).execute()
-        
-        if not response.data:
+        df = get_trips_dataframe(_supabase, 'created_at, user_id', created_at_gte=cutoff_date)
+
+        if df.empty:
             return pd.DataFrame()
-        
-        df = pd.DataFrame(response.data)
+
         # Normalize timestamps to UTC and then drop tz for grouping consistency
         df['created_at'] = pd.to_datetime(df['created_at'], utc=True)
         df['date'] = df['created_at'].dt.date
@@ -198,12 +254,13 @@ def get_usage_patterns(_supabase: Client):
 def get_trip_statistics(_supabase: Client):
     """Get overall trip statistics"""
     try:
-        response = _supabase.table('trips').select('mileage, actual_distance, start_time, end_time, created_at').execute()
-        
-        if not response.data:
+        df = get_trips_dataframe(
+            _supabase,
+            'mileage, actual_distance, start_time, end_time, created_at'
+        )
+
+        if df.empty:
             return {}
-        
-        df = pd.DataFrame(response.data)
  
         # Calculate duration from start_time and end_time if available
         if 'start_time' in df.columns and 'end_time' in df.columns:
@@ -215,7 +272,9 @@ def get_trip_statistics(_supabase: Client):
             df['duration'] = np.nan
  
         # Use actual_distance if available, otherwise use mileage
-        df['distance'] = df['actual_distance'].fillna(df['mileage']).fillna(0)
+        df['distance'] = pd.to_numeric(df.get('actual_distance'), errors='coerce').fillna(
+            pd.to_numeric(df.get('mileage'), errors='coerce')
+        ).fillna(0)
  
         # Normalize created_at to UTC for comparisons
         created_at_utc = pd.to_datetime(df['created_at'], utc=True)
@@ -244,15 +303,13 @@ def get_users_at_risk(_supabase: Client, inactivity_days: int = 14):
     Also returns the count of users who never made a trip.
     """
     try:
-        # Fetch trips
-        trips_resp = _supabase.table('trips').select('user_id, created_at, mileage, actual_distance').execute()
         profiles_resp = _supabase.table('profiles').select('id, full_name, phone_number, subscription_tier, created_at').execute()
 
         profiles_df = pd.DataFrame(profiles_resp.data or [])
         if profiles_df.empty:
             return pd.DataFrame(), 0
 
-        trips_df = pd.DataFrame(trips_resp.data or [])
+        trips_df = get_trips_dataframe(_supabase, 'user_id, created_at, mileage, actual_distance')
         if not trips_df.empty:
             # Normalize
             trips_df['created_at'] = pd.to_datetime(trips_df['created_at'], utc=True)
@@ -290,216 +347,682 @@ def get_users_at_risk(_supabase: Client, inactivity_days: int = 14):
         return pd.DataFrame(), 0
 
 @st.cache_data(ttl=300)
-def get_user_retention_analysis(_supabase: Client):
-    """Calculate user retention metrics and cohort analysis"""
+def normalize_subscription_tier(series: pd.Series) -> pd.Series:
+    """Normalize subscription tiers so downstream comparisons are consistent."""
+    normalized = series.fillna('free').astype(str).str.strip().str.lower()
+    return normalized.replace({'': 'free', 'nan': 'free', 'none': 'free', 'null': 'free'})
+
+def to_week_start(values) -> pd.Series:
+    """Return the Monday-start week bucket for a datetime-like series."""
+    timestamps = pd.to_datetime(values, errors='coerce', utc=True)
+    return timestamps.dt.normalize() - pd.to_timedelta(timestamps.dt.weekday, unit='D')
+
+@st.cache_data(ttl=300)
+def get_profile_dataset(_supabase: Client):
+    """Fetch profile context used across retention and segmentation views."""
     try:
-        # Try multiple table sources for user data
-        users_df = pd.DataFrame()
-        use_auth_table = False
-        table_source = "none"
-        
-        # Try auth.users table first (Supabase Auth)
-        try:
-            users_resp = _supabase.table('auth.users').select('id, email_confirmed_at, last_sign_in_at').execute()
-            users_df = pd.DataFrame(users_resp.data or [])
-            use_auth_table = True
-            table_source = "auth.users"
-        except:
-            pass
-        
-        # Try users table (if auth.users fails)
-        if users_df.empty:
-            try:
-                users_resp = _supabase.table('users').select('id, email_confirmed_at, last_sign_in_at, created_at').execute()
-                users_df = pd.DataFrame(users_resp.data or [])
-                use_auth_table = True
-                table_source = "users"
-            except:
-                pass
-        
-        # Fallback to profiles table
-        if users_df.empty:
-            try:
-                users_resp = _supabase.table('profiles').select('id, created_at').execute()
-                users_df = pd.DataFrame(users_resp.data or [])
-                use_auth_table = False
-                table_source = "profiles"
-            except:
-                pass
-        
-        # Fetch trip data
-        trips_resp = _supabase.table('trips').select('user_id, created_at').execute()
-        trips_df = pd.DataFrame(trips_resp.data or [])
-        
-        # Debug information
-        st.write(f"Debug: Found {len(users_df)} users and {len(trips_df)} trips")
-        st.write(f"Debug: Using table source: {table_source}")
-        st.write(f"Debug: Using auth table: {use_auth_table}")
-        if not users_df.empty:
-            st.write(f"Debug: Users columns: {list(users_df.columns)}")
-            if use_auth_table and 'email_confirmed_at' in users_df.columns:
-                st.write(f"Debug: Sample email_confirmed_at: {users_df['email_confirmed_at'].head(3).tolist()}")
-            elif 'created_at' in users_df.columns:
-                st.write(f"Debug: Sample created_at: {users_df['created_at'].head(3).tolist()}")
-                st.write(f"Debug: created_at dtype: {users_df['created_at'].dtype}")
-                st.write(f"Debug: created_at sample values: {users_df['created_at'].head(3).values}")
-        
-        if not trips_df.empty:
-            st.write(f"Debug: Trips columns: {list(trips_df.columns)}")
-            st.write(f"Debug: Sample trip created_at: {trips_df['created_at'].head(3).tolist()}")
-            st.write(f"Debug: trips created_at dtype: {trips_df['created_at'].dtype}")
-        
-        if users_df.empty:
-            return {}, pd.DataFrame(), {}
-        
-        # Normalize timestamps with error handling
-        try:
-            if use_auth_table and 'email_confirmed_at' in users_df.columns:
-                # Use email_confirmed_at as registration date
-                st.write("Debug: Using email_confirmed_at for registration date")
-                users_df['created_at_parsed'] = pd.to_datetime(users_df['email_confirmed_at'], errors='coerce', utc=True)
-            elif 'created_at' in users_df.columns:
-                # Use created_at as registration date
-                st.write("Debug: Using created_at for registration date")
-                users_df['created_at_parsed'] = pd.to_datetime(users_df['created_at'], errors='coerce', utc=True)
-            else:
-                st.error("Debug: No suitable date column found in users data")
-                return {}, pd.DataFrame(), {}
-            
-            # Remove rows with invalid dates
-            users_df = users_df.dropna(subset=['created_at_parsed'])
-            st.write(f"Debug: After date parsing, {len(users_df)} users remain")
-            
-            # Convert to date
-            users_df['registration_date'] = users_df['created_at_parsed'].dt.date
-            st.write("Debug: Successfully converted to registration_date")
-            
-        except Exception as e:
-            st.error(f"Debug: Error in user date processing: {str(e)}")
-            return {}, pd.DataFrame(), {}
-        
-        if not trips_df.empty:
-            try:
-                st.write("Debug: Processing trips data...")
-                trips_df['created_at_parsed'] = pd.to_datetime(trips_df['created_at'], errors='coerce', utc=True)
-                trips_df = trips_df.dropna(subset=['created_at_parsed'])  # Remove rows with invalid dates
-                trips_df['trip_date'] = trips_df['created_at_parsed'].dt.date
-                st.write(f"Debug: Successfully processed {len(trips_df)} trips")
-                
-                # Get first trip date for each user
-                first_trips = trips_df.groupby('user_id')['trip_date'].min().reset_index()
-                first_trips.columns = ['user_id', 'first_trip_date']
-                st.write(f"Debug: Found first trips for {len(first_trips)} users")
-                
-                # Merge with users
-                user_data = users_df.merge(first_trips, left_on='id', right_on='user_id', how='left')
-                st.write(f"Debug: Successfully merged user data, {len(user_data)} total records")
-            except Exception as e:
-                st.error(f"Debug: Error in trips processing: {str(e)}")
-                return {}, pd.DataFrame(), {}
+        response = _supabase.table('profiles').select(
+            'id, full_name, phone_number, subscription_tier, created_at'
+        ).execute()
+
+        profiles_df = pd.DataFrame(response.data or [])
+        expected_columns = [
+            'id', 'full_name', 'phone_number', 'subscription_tier', 'created_at'
+        ]
+
+        if profiles_df.empty:
+            return pd.DataFrame(columns=expected_columns + [
+                'subscription_tier_norm', 'subscription_segment'
+            ])
+
+        for col in expected_columns:
+            if col not in profiles_df.columns:
+                profiles_df[col] = None
+
+        profiles_df['id'] = profiles_df['id'].astype(str)
+        profiles_df['created_at'] = pd.to_datetime(
+            profiles_df['created_at'], errors='coerce', utc=True
+        )
+        profiles_df['subscription_tier_norm'] = normalize_subscription_tier(
+            profiles_df['subscription_tier']
+        )
+        profiles_df['subscription_segment'] = np.where(
+            profiles_df['subscription_tier_norm'].eq('free'),
+            'Free',
+            'Premium'
+        )
+
+        return profiles_df[[
+            'id', 'full_name', 'phone_number', 'subscription_tier', 'created_at',
+            'subscription_tier_norm', 'subscription_segment'
+        ]]
+    except Exception as e:
+        st.error(f"Error fetching profiles: {str(e)}")
+        return pd.DataFrame(columns=[
+            'id', 'full_name', 'phone_number', 'subscription_tier', 'created_at',
+            'subscription_tier_norm', 'subscription_segment'
+        ])
+
+@st.cache_data(ttl=300)
+def get_trip_activity_dataset(_supabase: Client):
+    """Fetch a paginated trip activity dataset for retention and segmentation analysis."""
+    try:
+        all_trips = []
+        page_size = 1000
+        offset = 0
+        max_rows = 200000
+
+        while True:
+            response = _supabase.table('trips').select(
+                'id, user_id, created_at, status, mileage, actual_distance'
+            ).order('created_at', desc=False).range(offset, offset + page_size - 1).execute()
+
+            batch = response.data or []
+            if not batch:
+                break
+
+            all_trips.extend(batch)
+            if len(batch) < page_size:
+                break
+
+            offset += page_size
+            if offset >= max_rows:
+                break
+
+        trips_df = pd.DataFrame(all_trips)
+        expected_columns = [
+            'id', 'user_id', 'created_at', 'status', 'mileage', 'actual_distance'
+        ]
+
+        if trips_df.empty:
+            return pd.DataFrame(columns=expected_columns + [
+                'distance', 'status_norm', 'is_completed'
+            ])
+
+        for col in expected_columns:
+            if col not in trips_df.columns:
+                trips_df[col] = None
+
+        trips_df['user_id'] = trips_df['user_id'].astype(str)
+        trips_df['created_at'] = pd.to_datetime(
+            trips_df['created_at'], errors='coerce', utc=True
+        )
+        trips_df = trips_df.dropna(subset=['created_at']).copy()
+
+        actual_distance = (
+            pd.to_numeric(trips_df['actual_distance'], errors='coerce')
+            if 'actual_distance' in trips_df.columns
+            else pd.Series(np.nan, index=trips_df.index)
+        )
+        mileage = (
+            pd.to_numeric(trips_df['mileage'], errors='coerce')
+            if 'mileage' in trips_df.columns
+            else pd.Series(np.nan, index=trips_df.index)
+        )
+        trips_df['distance'] = actual_distance.fillna(mileage).fillna(0)
+        trips_df['status_norm'] = trips_df['status'].fillna('').astype(str).str.strip().str.lower()
+        trips_df['is_completed'] = trips_df['status_norm'].isin({'completed', 'complated'})
+
+        return trips_df[[
+            'id', 'user_id', 'created_at', 'status', 'mileage', 'actual_distance',
+            'distance', 'status_norm', 'is_completed'
+        ]]
+    except Exception as e:
+        st.error(f"Error fetching trip activity dataset: {str(e)}")
+        return pd.DataFrame(columns=[
+            'id', 'user_id', 'created_at', 'status', 'mileage', 'actual_distance',
+            'distance', 'status_norm', 'is_completed'
+        ])
+
+@st.cache_data(ttl=300)
+def get_user_retention_analysis(_supabase: Client):
+    """Build activation and weekly retention outputs from registrations and trips."""
+    empty_activation = pd.DataFrame(columns=['milestone', 'users', 'rate'])
+    empty_cohort_summary = pd.DataFrame(columns=[
+        'registration_week', 'total_users', 'users_1_trip', 'users_3_trips',
+        'users_7_day', 'rate_1_trip', 'rate_3_trips', 'rate_7_day'
+    ])
+    empty_weekly = pd.DataFrame()
+    empty_activation_dist = pd.DataFrame(columns=['days_to_first_trip', 'users'])
+
+    try:
+        profiles_df = get_profile_dataset(_supabase)
+        auth_users_df = get_auth_users(_supabase)
+        trips_df = get_trip_activity_dataset(_supabase)
+
+        profile_base = profiles_df[[
+            'id', 'full_name', 'phone_number', 'subscription_tier',
+            'subscription_tier_norm', 'subscription_segment', 'created_at'
+        ]].copy() if not profiles_df.empty else pd.DataFrame(columns=[
+            'id', 'full_name', 'phone_number', 'subscription_tier',
+            'subscription_tier_norm', 'subscription_segment', 'created_at'
+        ])
+        profile_base.rename(columns={'created_at': 'profile_created_at'}, inplace=True)
+
+        auth_base = auth_users_df[[
+            'id', 'email', 'created_at', 'email_confirmed_at', 'last_sign_in_at'
+        ]].copy() if not auth_users_df.empty else pd.DataFrame(columns=[
+            'id', 'email', 'created_at', 'email_confirmed_at', 'last_sign_in_at'
+        ])
+        auth_base.rename(columns={'created_at': 'auth_created_at'}, inplace=True)
+
+        if profile_base.empty and auth_base.empty:
+            return {}, empty_activation, empty_cohort_summary, empty_weekly, empty_activation_dist
+
+        if profile_base.empty:
+            users_df = auth_base.copy()
+            users_df['full_name'] = None
+            users_df['phone_number'] = None
+            users_df['subscription_tier'] = 'free'
+            users_df['subscription_tier_norm'] = 'free'
+            users_df['subscription_segment'] = 'Free'
+            users_df['profile_created_at'] = pd.NaT
+        elif auth_base.empty:
+            users_df = profile_base.copy()
+            users_df['email'] = None
+            users_df['auth_created_at'] = pd.NaT
+            users_df['email_confirmed_at'] = pd.NaT
+            users_df['last_sign_in_at'] = pd.NaT
         else:
-            user_data = users_df.copy()
-            user_data['first_trip_date'] = None
-            st.write("Debug: No trips data, using users only")
-        
-        # Calculate retention metrics
-        try:
-            st.write("Debug: Starting retention calculations...")
-            now_utc = pd.Timestamp.now(tz='UTC').date()
-            
-            # Users who made their first trip
-            users_with_trips = user_data[user_data['first_trip_date'].notna()]
-            st.write(f"Debug: Found {len(users_with_trips)} users with trips")
-            
-            if users_with_trips.empty:
-                st.write("Debug: No users with trips found")
-                return {
-                    'day_1_retention': 0,
-                    'day_7_retention': 0,
-                    'day_30_retention': 0,
-                    'total_registered': len(user_data),
-                    'users_with_trips': 0,
-                    'activation_rate': 0
-                }, pd.DataFrame(), {}
-            
-            # Calculate days between registration and first trip
-            st.write("Debug: Calculating days to first trip...")
-            # When subtracting date objects, we get timedelta, so use .apply(lambda x: x.days)
-            users_with_trips['days_to_first_trip'] = (users_with_trips['first_trip_date'] - users_with_trips['registration_date']).apply(lambda x: x.days)
-            st.write("Debug: Successfully calculated days to first trip")
-        except Exception as e:
-            st.error(f"Debug: Error in retention calculations: {str(e)}")
-            return {}, pd.DataFrame(), {}
-        
-        # Day 1 retention (users who made first trip within 1 day)
-        day_1_retention = len(users_with_trips[users_with_trips['days_to_first_trip'] <= 1]) / len(users_with_trips) * 100
-        
-        # Day 7 retention (users who made first trip within 7 days)
-        day_7_retention = len(users_with_trips[users_with_trips['days_to_first_trip'] <= 7]) / len(users_with_trips) * 100
-        
-        # Day 30 retention (users who made first trip within 30 days)
-        day_30_retention = len(users_with_trips[users_with_trips['days_to_first_trip'] <= 30]) / len(users_with_trips) * 100
-        
-        # Activation rate (users who made at least one trip)
-        activation_rate = len(users_with_trips) / len(user_data) * 100
-        
-        retention_metrics = {
-            'day_1_retention': round(day_1_retention, 1),
-            'day_7_retention': round(day_7_retention, 1),
-            'day_30_retention': round(day_30_retention, 1),
-            'total_registered': len(user_data),
-            'users_with_trips': len(users_with_trips),
-            'activation_rate': round(activation_rate, 1)
-        }
-        
-        # Cohort analysis - group by registration week
-        try:
-            st.write("Debug: Starting cohort analysis...")
-            # Convert registration_date to datetime if it's not already
-            if not pd.api.types.is_datetime64_any_dtype(user_data['registration_date']):
-                user_data['registration_date'] = pd.to_datetime(user_data['registration_date'])
-                st.write("Debug: Converted registration_date to datetime")
-            
-            # Calculate registration week (Monday of the week)
-            user_data['registration_week'] = user_data['registration_date'].apply(
-                lambda x: x - pd.Timedelta(days=x.weekday()) if pd.notna(x) else None
+            users_df = profile_base.merge(auth_base, on='id', how='outer')
+
+        users_df['profile_created_at'] = pd.to_datetime(
+            users_df['profile_created_at'], errors='coerce', utc=True
+        )
+        users_df['auth_created_at'] = pd.to_datetime(
+            users_df['auth_created_at'], errors='coerce', utc=True
+        )
+        users_df['registration_at'] = users_df['auth_created_at'].combine_first(
+            users_df['profile_created_at']
+        )
+        users_df = users_df.dropna(subset=['registration_at']).copy()
+
+        if users_df.empty:
+            return {}, empty_activation, empty_cohort_summary, empty_weekly, empty_activation_dist
+
+        users_df['subscription_tier'] = users_df['subscription_tier'].fillna('free')
+        users_df['subscription_tier_norm'] = normalize_subscription_tier(
+            users_df['subscription_tier']
+        )
+        users_df['subscription_segment'] = np.where(
+            users_df['subscription_tier_norm'].eq('free'),
+            'Free',
+            'Premium'
+        )
+        users_df['registration_week'] = to_week_start(users_df['registration_at'])
+
+        if trips_df.empty:
+            total_registered = int(len(users_df))
+            summary = {
+                'total_registered': total_registered,
+                'activation_1_trip_users': 0,
+                'activation_1_trip_rate': 0.0,
+                'activation_3_trip_users': 0,
+                'activation_3_trip_rate': 0.0,
+                'activation_7_day_users': 0,
+                'activation_7_day_rate': 0.0,
+                'week_1_retention': 0.0,
+                'week_4_retention': 0.0,
+                'week_1_eligible_users': 0,
+                'week_4_eligible_users': 0,
+                'median_days_to_first_trip': None
+            }
+            activation_breakdown_df = pd.DataFrame([
+                {'milestone': '1+ Trips', 'users': 0, 'rate': 0.0},
+                {'milestone': '3+ Trips', 'users': 0, 'rate': 0.0},
+                {'milestone': '1st Trip in 7 Days', 'users': 0, 'rate': 0.0}
+            ])
+            return summary, activation_breakdown_df, empty_cohort_summary, empty_weekly, empty_activation_dist
+
+        ordered_trips = trips_df.sort_values(['user_id', 'created_at']).copy()
+        ordered_trips['trip_number'] = ordered_trips.groupby('user_id').cumcount() + 1
+
+        trip_summary_df = ordered_trips.groupby('user_id').agg(
+            total_trips=('id', 'count'),
+            completed_trips=('is_completed', 'sum'),
+            first_trip_at=('created_at', 'min'),
+            last_trip_at=('created_at', 'max')
+        ).reset_index().rename(columns={'user_id': 'id'})
+
+        third_trip_df = (
+            ordered_trips[ordered_trips['trip_number'] == 3][['user_id', 'created_at']]
+            .rename(columns={'user_id': 'id', 'created_at': 'third_trip_at'})
+        )
+
+        user_activity_df = users_df.merge(trip_summary_df, on='id', how='left').merge(
+            third_trip_df, on='id', how='left'
+        )
+        for col in ['total_trips', 'completed_trips']:
+            user_activity_df[col] = pd.to_numeric(
+                user_activity_df[col], errors='coerce'
+            ).fillna(0).astype(int)
+
+        raw_days = (
+            user_activity_df['first_trip_at'] - user_activity_df['registration_at']
+        ).dt.total_seconds() / 86400
+        user_activity_df['days_to_first_trip'] = raw_days.where(
+            user_activity_df['first_trip_at'].notna()
+        ).clip(lower=0)
+        user_activity_df['days_to_first_trip_bucket'] = (
+            np.floor(user_activity_df['days_to_first_trip'])
+            .where(user_activity_df['days_to_first_trip'].notna())
+            .astype('Int64')
+        )
+
+        total_registered = int(len(user_activity_df))
+        users_1_trip = int((user_activity_df['total_trips'] >= 1).sum())
+        users_3_trips = int((user_activity_df['total_trips'] >= 3).sum())
+        users_7_day = int((user_activity_df['days_to_first_trip'] <= 7).sum())
+
+        activation_breakdown_df = pd.DataFrame([
+            {
+                'milestone': '1+ Trips',
+                'users': users_1_trip,
+                'rate': (users_1_trip / total_registered * 100) if total_registered > 0 else 0
+            },
+            {
+                'milestone': '3+ Trips',
+                'users': users_3_trips,
+                'rate': (users_3_trips / total_registered * 100) if total_registered > 0 else 0
+            },
+            {
+                'milestone': '1st Trip in 7 Days',
+                'users': users_7_day,
+                'rate': (users_7_day / total_registered * 100) if total_registered > 0 else 0
+            }
+        ])
+
+        cohort_summary_df = (
+            user_activity_df.groupby('registration_week').agg(
+                total_users=('id', 'count'),
+                users_1_trip=('total_trips', lambda s: int((s >= 1).sum())),
+                users_3_trips=('total_trips', lambda s: int((s >= 3).sum())),
+                users_7_day=('days_to_first_trip', lambda s: int((s <= 7).sum()))
             )
-            st.write("Debug: Successfully calculated registration weeks")
-            
-            # Also add registration_week to users_with_trips
-            if not users_with_trips.empty:
-                users_with_trips = users_with_trips.copy()  # Avoid SettingWithCopyWarning
-                users_with_trips['registration_week'] = users_with_trips['registration_date'].apply(
-                    lambda x: pd.to_datetime(x) - pd.Timedelta(days=pd.to_datetime(x).weekday()) if pd.notna(x) else None
-                )
-                st.write("Debug: Added registration_week to users_with_trips")
-        except Exception as e:
-            st.error(f"Debug: Error in cohort analysis: {str(e)}")
-            return retention_metrics, pd.DataFrame(), {}
-        
-        cohort_data = []
-        for week in sorted(user_data['registration_week'].dropna().unique()):
-            week_users = user_data[user_data['registration_week'] == week]
-            week_trips = users_with_trips[users_with_trips['registration_week'] == week] if not users_with_trips.empty else pd.DataFrame()
-            
-            cohort_data.append({
-                'cohort_week': week.strftime('%Y-%m-%d') if pd.notna(week) else 'Unknown',
-                'total_users': len(week_users),
-                'activated_users': len(week_trips),
-                'activation_rate': len(week_trips) / len(week_users) * 100 if len(week_users) > 0 else 0
-            })
-        
-        cohort_df = pd.DataFrame(cohort_data)
-        
-        # Time-to-activation distribution
-        activation_dist = users_with_trips['days_to_first_trip'].value_counts().sort_index()
-        activation_dist = activation_dist.head(30)  # First 30 days
-        
-        return retention_metrics, cohort_df, activation_dist.to_dict()
-        
+            .reset_index()
+            .sort_values('registration_week', ascending=False)
+        )
+
+        for numerator_col, rate_col in [
+            ('users_1_trip', 'rate_1_trip'),
+            ('users_3_trips', 'rate_3_trips'),
+            ('users_7_day', 'rate_7_day')
+        ]:
+            cohort_summary_df[rate_col] = np.where(
+                cohort_summary_df['total_users'] > 0,
+                cohort_summary_df[numerator_col] / cohort_summary_df['total_users'] * 100,
+                0
+            )
+
+        activation_dist_df = (
+            user_activity_df.dropna(subset=['days_to_first_trip_bucket'])
+            .groupby('days_to_first_trip_bucket')['id']
+            .nunique()
+            .reset_index(name='users')
+            .rename(columns={'days_to_first_trip_bucket': 'days_to_first_trip'})
+            .sort_values('days_to_first_trip')
+            .head(30)
+        )
+
+        activity_df = ordered_trips.merge(
+            users_df[['id', 'registration_at', 'registration_week']],
+            left_on='user_id',
+            right_on='id',
+            how='inner'
+        )
+        activity_df = activity_df[
+            activity_df['created_at'] >= activity_df['registration_at']
+        ].copy()
+        activity_df['activity_week'] = to_week_start(activity_df['created_at'])
+        activity_df['weeks_since_registration'] = (
+            (activity_df['activity_week'] - activity_df['registration_week']).dt.days // 7
+        ).astype(int)
+        activity_df = activity_df[activity_df['weeks_since_registration'] >= 0]
+
+        cohort_sizes = users_df.groupby('registration_week')['id'].nunique().sort_index()
+        weekly_retention_df = pd.DataFrame()
+
+        if not activity_df.empty:
+            weekly_retention_df = (
+                activity_df[['user_id', 'registration_week', 'weeks_since_registration']]
+                .drop_duplicates()
+                .groupby(['registration_week', 'weeks_since_registration'])['user_id']
+                .nunique()
+                .reset_index(name='active_users')
+            )
+            weekly_retention_df['cohort_size'] = weekly_retention_df['registration_week'].map(cohort_sizes)
+            weekly_retention_df['retention_rate'] = np.where(
+                weekly_retention_df['cohort_size'] > 0,
+                weekly_retention_df['active_users'] / weekly_retention_df['cohort_size'] * 100,
+                0
+            )
+
+        current_week_start = to_week_start(pd.Series([pd.Timestamp.now(tz='UTC')])).iloc[0]
+
+        def weighted_retention_for_week(week_number: int):
+            eligible_cohorts = cohort_sizes.index[
+                cohort_sizes.index <= (current_week_start - pd.Timedelta(days=7 * week_number))
+            ]
+            eligible_users = int(cohort_sizes.reindex(eligible_cohorts).fillna(0).sum())
+            if eligible_users == 0 or weekly_retention_df.empty:
+                return 0.0, eligible_users
+
+            week_activity = (
+                weekly_retention_df[weekly_retention_df['weeks_since_registration'] == week_number]
+                .set_index('registration_week')['active_users']
+            )
+            retained_users = int(week_activity.reindex(eligible_cohorts).fillna(0).sum())
+            rate = retained_users / eligible_users * 100 if eligible_users > 0 else 0
+            return round(rate, 1), eligible_users
+
+        week_1_retention, week_1_eligible_users = weighted_retention_for_week(1)
+        week_4_retention, week_4_eligible_users = weighted_retention_for_week(4)
+
+        median_days_to_first_trip = (
+            round(float(user_activity_df['days_to_first_trip'].dropna().median()), 1)
+            if user_activity_df['days_to_first_trip'].notna().any()
+            else None
+        )
+
+        summary = {
+            'total_registered': total_registered,
+            'activation_1_trip_users': users_1_trip,
+            'activation_1_trip_rate': round(
+                (users_1_trip / total_registered * 100) if total_registered > 0 else 0, 1
+            ),
+            'activation_3_trip_users': users_3_trips,
+            'activation_3_trip_rate': round(
+                (users_3_trips / total_registered * 100) if total_registered > 0 else 0, 1
+            ),
+            'activation_7_day_users': users_7_day,
+            'activation_7_day_rate': round(
+                (users_7_day / total_registered * 100) if total_registered > 0 else 0, 1
+            ),
+            'week_1_retention': week_1_retention,
+            'week_4_retention': week_4_retention,
+            'week_1_eligible_users': week_1_eligible_users,
+            'week_4_eligible_users': week_4_eligible_users,
+            'median_days_to_first_trip': median_days_to_first_trip
+        }
+
+        return summary, activation_breakdown_df, cohort_summary_df, weekly_retention_df, activation_dist_df
+
     except Exception as e:
         st.error(f"Error calculating retention analysis: {str(e)}")
-        return {}, pd.DataFrame(), {}
+        return {}, empty_activation, empty_cohort_summary, empty_weekly, empty_activation_dist
+
+def build_upgrade_conversion_funnel(events_df: pd.DataFrame):
+    """Build a paywall-to-purchase funnel from normalized upgrade events."""
+    empty_funnel = pd.DataFrame(columns=['Stage', 'Users', 'Events', 'Conversion from Previous', 'Conversion from Paywall'])
+    empty_paywall = pd.DataFrame(columns=['Feature', 'Paywall Opens', 'Users'])
+
+    if events_df.empty:
+        return empty_funnel, empty_paywall, False
+
+    analysis_df = events_df.copy()
+    analysis_df['event_name_norm'] = analysis_df['event_name'].fillna('').astype(str).str.strip().str.lower()
+    analysis_df['feature_display'] = analysis_df['feature_display'].fillna('Unknown').replace('', 'Unknown')
+
+    stage_patterns = {
+        'Paywall Opened': ['paywall_opened', 'paywall_viewed', 'paywall_shown', 'paywall_displayed'],
+        'Purchase Started': ['purchase_started', 'checkout_started'],
+        'Purchase Completed': ['purchase_completed', 'purchase_complete', 'purchase_succeeded', 'subscription_purchased']
+    }
+
+    paywall_mask = analysis_df['event_name_norm'].apply(
+        lambda value: any(pattern in value for pattern in stage_patterns['Paywall Opened'])
+    )
+    purchase_start_mask = analysis_df['event_name_norm'].apply(
+        lambda value: any(pattern in value for pattern in stage_patterns['Purchase Started'])
+    )
+    purchase_complete_mask = analysis_df['event_name_norm'].apply(
+        lambda value: any(pattern in value for pattern in stage_patterns['Purchase Completed'])
+    )
+
+    paywall_users = set(analysis_df.loc[paywall_mask, 'user_id'].astype(str))
+    purchase_started_users = set(analysis_df.loc[purchase_start_mask, 'user_id'].astype(str)) & paywall_users
+    purchase_completed_users = set(analysis_df.loc[purchase_complete_mask, 'user_id'].astype(str)) & paywall_users
+
+    funnel_rows = [
+        {
+            'Stage': 'Paywall Opened',
+            'Users': len(paywall_users),
+            'Events': int(paywall_mask.sum())
+        },
+        {
+            'Stage': 'Purchase Started',
+            'Users': len(purchase_started_users),
+            'Events': int((purchase_start_mask & analysis_df['user_id'].astype(str).isin(paywall_users)).sum())
+        },
+        {
+            'Stage': 'Purchase Completed',
+            'Users': len(purchase_completed_users),
+            'Events': int((purchase_complete_mask & analysis_df['user_id'].astype(str).isin(paywall_users)).sum())
+        }
+    ]
+
+    funnel_df = pd.DataFrame(funnel_rows)
+    previous_users = None
+    paywall_user_count = funnel_df.iloc[0]['Users'] if not funnel_df.empty else 0
+    conversion_from_previous = []
+    conversion_from_paywall = []
+
+    for _, row in funnel_df.iterrows():
+        current_users = row['Users']
+        if previous_users in (None, 0):
+            conversion_from_previous.append(100.0 if current_users > 0 else 0.0)
+        else:
+            conversion_from_previous.append(current_users / previous_users * 100)
+
+        if paywall_user_count > 0:
+            conversion_from_paywall.append(current_users / paywall_user_count * 100)
+        else:
+            conversion_from_paywall.append(0.0)
+
+        previous_users = current_users
+
+    funnel_df['Conversion from Previous'] = conversion_from_previous
+    funnel_df['Conversion from Paywall'] = conversion_from_paywall
+
+    paywall_feature_df = (
+        analysis_df[paywall_mask]
+        .groupby('feature_display')
+        .agg(
+            **{
+                'Paywall Opens': ('id', 'count'),
+                'Users': ('user_id', 'nunique')
+            }
+        )
+        .reset_index()
+        .rename(columns={'feature_display': 'Feature'})
+        .sort_values(['Users', 'Paywall Opens'], ascending=[False, False])
+        .head(10)
+    )
+
+    has_completed_purchase_events = bool(funnel_df.loc[
+        funnel_df['Stage'] == 'Purchase Completed', 'Users'
+    ].max() > 0) if not funnel_df.empty else False
+
+    return funnel_df, paywall_feature_df, has_completed_purchase_events
+
+def build_feature_usage_summary(events_df: pd.DataFrame):
+    """Summarize tracked feature usage and split it by free vs premium users."""
+    empty_summary = pd.DataFrame(columns=[
+        'Feature', 'Events', 'Unique Users', 'Free Users', 'Premium Users',
+        'Free Events', 'Premium Events', 'Paywall Opens', 'Purchase Starts', 'Last Seen'
+    ])
+
+    if events_df.empty:
+        return empty_summary
+
+    usage_df = events_df.copy()
+    usage_df['event_name_norm'] = usage_df['event_name'].fillna('').astype(str).str.strip().str.lower()
+    usage_df['feature_display'] = usage_df['feature_display'].fillna('Unknown').replace('', 'Unknown')
+    usage_df['subscription_segment'] = np.where(
+        normalize_subscription_tier(usage_df['subscription_tier']).eq('free'),
+        'Free',
+        'Premium'
+    )
+
+    feature_summary = (
+        usage_df.groupby('feature_display')
+        .agg(
+            **{
+                'Events': ('id', 'count'),
+                'Unique Users': ('user_id', 'nunique'),
+                'Paywall Opens': ('event_name_norm', lambda s: s.str.contains('paywall_opened', na=False).sum()),
+                'Purchase Starts': ('event_name_norm', lambda s: s.str.contains('purchase_started', na=False).sum()),
+                'Last Seen': ('event_ts', 'max')
+            }
+        )
+        .reset_index()
+        .rename(columns={'feature_display': 'Feature'})
+    )
+
+    user_segment_counts = (
+        usage_df[['feature_display', 'user_id', 'subscription_segment']]
+        .drop_duplicates()
+        .groupby(['feature_display', 'subscription_segment'])
+        .size()
+        .unstack(fill_value=0)
+    )
+    event_segment_counts = (
+        usage_df.groupby(['feature_display', 'subscription_segment'])
+        .size()
+        .unstack(fill_value=0)
+    )
+
+    for segment in ['Free', 'Premium']:
+        feature_summary[f'{segment} Users'] = feature_summary['Feature'].map(
+            user_segment_counts.get(segment, pd.Series(dtype='int64'))
+        ).fillna(0).astype(int)
+        feature_summary[f'{segment} Events'] = feature_summary['Feature'].map(
+            event_segment_counts.get(segment, pd.Series(dtype='int64'))
+        ).fillna(0).astype(int)
+
+    feature_summary['Last Seen'] = pd.to_datetime(
+        feature_summary['Last Seen'], errors='coerce', utc=True
+    )
+
+    return feature_summary.sort_values(
+        ['Unique Users', 'Events'], ascending=[False, False]
+    ).reset_index(drop=True)
+
+@st.cache_data(ttl=300)
+def get_subscription_segment_behavior(_supabase: Client, lookback_days: int = 30):
+    """Compare free vs premium behavior over a configurable lookback window."""
+    empty_summary = pd.DataFrame(columns=[
+        'Segment', 'Users', 'Active Users', 'Active Rate', 'Avg Trips/User',
+        'Avg Completed Trips/User', '3+ Trip Users', '3+ Trip Rate',
+        'Tracked Events', 'Avg Tracked Events/User', 'Paywall Open Users',
+        'Purchase Start Users'
+    ])
+
+    try:
+        profiles_df = get_profile_dataset(_supabase)
+        if profiles_df.empty:
+            return empty_summary
+
+        cutoff_dt = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=lookback_days)
+        users_df = profiles_df[['id', 'subscription_segment']].copy()
+
+        trips_df = get_trip_activity_dataset(_supabase)
+        recent_trips_df = trips_df[trips_df['created_at'] >= cutoff_dt].copy() if not trips_df.empty else pd.DataFrame()
+
+        if recent_trips_df.empty:
+            trip_user_summary = pd.DataFrame(columns=[
+                'id', 'trips', 'completed_trips', 'distance'
+            ])
+        else:
+            trip_user_summary = (
+                recent_trips_df.groupby('user_id')
+                .agg(
+                    trips=('id', 'count'),
+                    completed_trips=('is_completed', 'sum'),
+                    distance=('distance', 'sum')
+                )
+                .reset_index()
+                .rename(columns={'user_id': 'id'})
+            )
+
+        events_df = get_upgrade_intent_events(_supabase, lookback_days)
+        if events_df.empty:
+            event_user_summary = pd.DataFrame(columns=[
+                'id', 'tracked_events', 'paywall_opens', 'purchase_starts'
+            ])
+        else:
+            event_analysis_df = events_df.copy()
+            event_analysis_df['event_name_norm'] = event_analysis_df['event_name'].fillna('').astype(str).str.strip().str.lower()
+            event_user_summary = (
+                event_analysis_df.groupby('user_id')
+                .agg(
+                    tracked_events=('id', 'count'),
+                    paywall_opens=('event_name_norm', lambda s: s.str.contains('paywall_opened', na=False).sum()),
+                    purchase_starts=('event_name_norm', lambda s: s.str.contains('purchase_started', na=False).sum())
+                )
+                .reset_index()
+                .rename(columns={'user_id': 'id'})
+            )
+
+        behavior_df = users_df.merge(trip_user_summary, on='id', how='left').merge(
+            event_user_summary, on='id', how='left'
+        )
+
+        for col in ['trips', 'completed_trips', 'distance', 'tracked_events', 'paywall_opens', 'purchase_starts']:
+            behavior_df[col] = pd.to_numeric(behavior_df[col], errors='coerce').fillna(0)
+
+        behavior_df['is_active'] = behavior_df['trips'] > 0
+        behavior_df['is_power_user'] = behavior_df['trips'] >= 3
+        behavior_df['has_paywall_open'] = behavior_df['paywall_opens'] > 0
+        behavior_df['has_purchase_start'] = behavior_df['purchase_starts'] > 0
+
+        summary_df = (
+            behavior_df.groupby('subscription_segment')
+            .agg(
+                Users=('id', 'count'),
+                Active_Users=('is_active', 'sum'),
+                Avg_Trips_Per_User=('trips', 'mean'),
+                Avg_Completed_Trips_Per_User=('completed_trips', 'mean'),
+                Three_Plus_Trip_Users=('is_power_user', 'sum'),
+                Tracked_Events=('tracked_events', 'sum'),
+                Avg_Tracked_Events_Per_User=('tracked_events', 'mean'),
+                Paywall_Open_Users=('has_paywall_open', 'sum'),
+                Purchase_Start_Users=('has_purchase_start', 'sum')
+            )
+            .reset_index()
+            .rename(columns={'subscription_segment': 'Segment'})
+        )
+
+        summary_df['Active Rate'] = np.where(
+            summary_df['Users'] > 0,
+            summary_df['Active_Users'] / summary_df['Users'] * 100,
+            0
+        )
+        summary_df['3+ Trip Rate'] = np.where(
+            summary_df['Users'] > 0,
+            summary_df['Three_Plus_Trip_Users'] / summary_df['Users'] * 100,
+            0
+        )
+
+        return summary_df[[
+            'Segment', 'Users', 'Active_Users', 'Active Rate',
+            'Avg_Trips_Per_User', 'Avg_Completed_Trips_Per_User',
+            'Three_Plus_Trip_Users', '3+ Trip Rate', 'Tracked_Events',
+            'Avg_Tracked_Events_Per_User', 'Paywall_Open_Users',
+            'Purchase_Start_Users'
+        ]].rename(columns={
+            'Active_Users': 'Active Users',
+            'Avg_Trips_Per_User': 'Avg Trips/User',
+            'Avg_Completed_Trips_Per_User': 'Avg Completed Trips/User',
+            'Three_Plus_Trip_Users': '3+ Trip Users',
+            'Tracked_Events': 'Tracked Events',
+            'Avg_Tracked_Events_Per_User': 'Avg Tracked Events/User',
+            'Paywall_Open_Users': 'Paywall Open Users',
+            'Purchase_Start_Users': 'Purchase Start Users'
+        })
+    except Exception as e:
+        st.error(f"Error calculating subscription segment behavior: {str(e)}")
+        return empty_summary
 
 def format_duration(minutes):
     """Format duration from minutes to readable format"""
@@ -1592,6 +2115,16 @@ def main():
                 )
         else:
             st.info("No revenue data available")
+
+        st.markdown("---")
+        st.markdown("#### Scaling Phase Metrics Readiness")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info("**Acquisition Channels**\n\nRequires campaign/source attribution at signup or in event metadata.")
+        with col2:
+            st.info("**LTV**\n\nHold until you have real billing or payment-completion data. Estimated proxies would be noisy.")
+        with col3:
+            st.info("**CAC**\n\nRequires ad spend plus attributable acquisition channels. The current schema does not include either.")
     
     # Growth Metrics Tab
     with tab3:
@@ -1894,7 +2427,8 @@ def main():
         
         with col2:
             # Average trips per active user
-            avg_trips_active = trip_stats.get('trips_this_month', 0) / active_users if active_users > 0 else 0
+            selected_period_trip_count = get_trip_count(supabase, time_range)
+            avg_trips_active = selected_period_trip_count / active_users if active_users > 0 else 0
             st.metric(
                 "Avg Trips per Active User",
                 f"{avg_trips_active:.1f}",
@@ -1912,11 +2446,17 @@ def main():
         
         with col3:
             # Power users (>10 trips)
-            if not top_users.empty:
-                power_users = len(top_users[top_users['trip_count'] > 10])
+            power_users = get_power_user_count(supabase, 10)
+            if power_users > 0:
                 st.metric(
                     "Power Users",
                     power_users,
+                    ">10 trips"
+                )
+            else:
+                st.metric(
+                    "Power Users",
+                    0,
                     ">10 trips"
                 )
             
@@ -2035,242 +2575,206 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
     
     with tab6:
-        st.subheader("📈 User Retention Analysis")
-        
-        # Get retention data
-        retention_metrics, cohort_df, activation_dist = get_user_retention_analysis(supabase)
-        
-        if not retention_metrics:
-            st.warning("No retention data available. Please ensure you have user registration and trip data.")
+        st.subheader("📈 Activation & Weekly Retention")
+        st.caption("Source: registrations from Supabase Auth / profiles and activity from `trips.created_at`.")
+
+        retention_summary, activation_breakdown_df, cohort_summary_df, weekly_retention_df, activation_dist_df = get_user_retention_analysis(supabase)
+
+        if not retention_summary:
+            st.warning("No retention data available. Please ensure registration and trip data exist.")
             return
-        
-        # Key retention metrics
-        st.markdown("### 🎯 Key Retention Metrics")
-        col1, col2, col3, col4 = st.columns(4)
-        
+
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
-            st.metric(
-                "Day 1 Retention",
-                f"{retention_metrics.get('day_1_retention', 0):.1f}%",
-                "Users who made first trip within 1 day"
-            )
-        
+            st.metric("Registered Users", f"{retention_summary.get('total_registered', 0):,}")
         with col2:
             st.metric(
-                "Day 7 Retention", 
-                f"{retention_metrics.get('day_7_retention', 0):.1f}%",
-                "Users who made first trip within 7 days"
+                "1+ Trips",
+                f"{retention_summary.get('activation_1_trip_rate', 0):.1f}%",
+                f"{retention_summary.get('activation_1_trip_users', 0):,} users"
             )
-        
         with col3:
             st.metric(
-                "Day 30 Retention",
-                f"{retention_metrics.get('day_30_retention', 0):.1f}%",
-                "Users who made first trip within 30 days"
+                "3+ Trips",
+                f"{retention_summary.get('activation_3_trip_rate', 0):.1f}%",
+                f"{retention_summary.get('activation_3_trip_users', 0):,} users"
             )
-        
         with col4:
             st.metric(
-                "Activation Rate",
-                f"{retention_metrics.get('activation_rate', 0):.1f}%",
-                f"{retention_metrics.get('users_with_trips', 0)}/{retention_metrics.get('total_registered', 0)} users"
+                "Activated in 7 Days",
+                f"{retention_summary.get('activation_7_day_rate', 0):.1f}%",
+                f"{retention_summary.get('activation_7_day_users', 0):,} users"
             )
-        
-        # Retention funnel visualization
-        st.markdown("---")
-        st.subheader("🔄 User Activation Funnel")
-        
-        funnel_data = {
-            'Stage': ['Registered Users', 'Day 1 Active', 'Day 7 Active', 'Day 30 Active'],
-            'Count': [
-                retention_metrics.get('total_registered', 0),
-                int(retention_metrics.get('total_registered', 0) * retention_metrics.get('day_1_retention', 0) / 100),
-                int(retention_metrics.get('total_registered', 0) * retention_metrics.get('day_7_retention', 0) / 100),
-                int(retention_metrics.get('total_registered', 0) * retention_metrics.get('day_30_retention', 0) / 100)
-            ],
-            'Percentage': [
-                100.0,
-                retention_metrics.get('day_1_retention', 0),
-                retention_metrics.get('day_7_retention', 0),
-                retention_metrics.get('day_30_retention', 0)
-            ]
-        }
-        
-        funnel_df = pd.DataFrame(funnel_data)
-        
-        fig = go.Figure(go.Funnel(
-            y=funnel_df['Stage'],
-            x=funnel_df['Count'],
-            textinfo="value+percent initial",
-            marker=dict(color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4'])
-        ))
-        
-        fig.update_layout(
-            title="User Activation Funnel",
-            height=400,
-            margin=dict(l=100, r=50, t=50, b=50)
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Time to activation distribution
-        if activation_dist:
-            st.markdown("---")
-            st.subheader("⏱️ Time to First Trip Distribution")
-            
-            days = list(activation_dist.keys())
-            counts = list(activation_dist.values())
-            
-            fig = go.Figure(data=[
-                go.Bar(x=days, y=counts, marker_color='lightblue')
-            ])
-            
-            fig.update_layout(
-                title="Days Between Registration and First Trip",
-                xaxis_title="Days",
-                yaxis_title="Number of Users",
-                height=400
+        with col5:
+            st.metric(
+                "Week 1 Retention",
+                f"{retention_summary.get('week_1_retention', 0):.1f}%",
+                f"{retention_summary.get('week_1_eligible_users', 0):,} eligible"
             )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Cohort analysis
-        if not cohort_df.empty:
-            st.markdown("---")
-            st.subheader("📊 Weekly Cohort Analysis")
-            
-            # Display cohort table
-            display_cohort = cohort_df.copy()
-            display_cohort['activation_rate'] = display_cohort['activation_rate'].round(1)
-            display_cohort.rename(columns={
-                'cohort_week': 'Registration Week',
-                'total_users': 'Total Users',
-                'activated_users': 'Activated Users',
-                'activation_rate': 'Activation Rate (%)'
-            }, inplace=True)
-            
-            st.dataframe(display_cohort, use_container_width=True, hide_index=True)
-            
-            # Cohort visualization
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
-                x=cohort_df['cohort_week'],
-                y=cohort_df['total_users'],
-                mode='lines+markers',
-                name='Total Users',
-                line=dict(color='blue', width=3),
-                marker=dict(size=8)
-            ))
-            
-            fig.add_trace(go.Scatter(
-                x=cohort_df['cohort_week'],
-                y=cohort_df['activated_users'],
-                mode='lines+markers',
-                name='Activated Users',
-                line=dict(color='green', width=3),
-                marker=dict(size=8)
-            ))
-            
-            fig.update_layout(
-                title="User Registration and Activation by Week",
-                xaxis_title="Registration Week",
-                yaxis_title="Number of Users",
-                height=400,
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Retention insights and recommendations
-        st.markdown("---")
-        st.subheader("💡 Retention Insights & Recommendations")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### 📈 Current Performance")
-            
-            day_1 = retention_metrics.get('day_1_retention', 0)
-            day_7 = retention_metrics.get('day_7_retention', 0)
-            day_30 = retention_metrics.get('day_30_retention', 0)
-            activation = retention_metrics.get('activation_rate', 0)
-            
-            if day_1 < 30:
-                st.warning(f"**Low Day 1 Retention ({day_1:.1f}%)** - Users aren't engaging immediately after registration")
-            elif day_1 > 60:
-                st.success(f"**Strong Day 1 Retention ({day_1:.1f}%)** - Great first impression!")
-            else:
-                st.info(f"**Moderate Day 1 Retention ({day_1:.1f}%)** - Room for improvement")
-            
-            if activation < 50:
-                st.warning(f"**Low Activation Rate ({activation:.1f}%)** - Many users never make their first trip")
-            elif activation > 80:
-                st.success(f"**High Activation Rate ({activation:.1f}%)** - Excellent user onboarding!")
-            else:
-                st.info(f"**Moderate Activation Rate ({activation:.1f}%)** - Good foundation to build on")
-        
-        with col2:
-            st.markdown("### 🎯 Actionable Recommendations")
-            
-            if day_1 < 40:
-                st.markdown("""
-                **🚀 Improve Day 1 Retention:**
-                - Send welcome email with app tutorial
-                - Offer first-trip incentives
-                - Simplify onboarding process
-                - Add progress indicators
-                """)
-            
-            if activation < 60:
-                st.markdown("""
-                **📱 Boost Activation:**
-                - Create guided first trip experience
-                - Implement push notifications
-                - Add gamification elements
-                - Provide clear value proposition
-                """)
-            
-            if day_7 < day_1 * 0.8:
-                st.markdown("""
-                **🔄 Maintain Engagement:**
-                - Send follow-up messages
-                - Create habit-forming features
-                - Implement streak tracking
-                - Offer weekly challenges
-                """)
-        
-        # Download retention report
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("📊 Download Retention Report", use_container_width=True):
-                # Create comprehensive retention report
-                report_data = {
-                    'Metric': ['Total Registered Users', 'Users with Trips', 'Activation Rate (%)', 
-                              'Day 1 Retention (%)', 'Day 7 Retention (%)', 'Day 30 Retention (%)'],
-                    'Value': [
-                        retention_metrics.get('total_registered', 0),
-                        retention_metrics.get('users_with_trips', 0),
-                        retention_metrics.get('activation_rate', 0),
-                        retention_metrics.get('day_1_retention', 0),
-                        retention_metrics.get('day_7_retention', 0),
-                        retention_metrics.get('day_30_retention', 0)
-                    ]
-                }
-                
-                report_df = pd.DataFrame(report_data)
-                csv = report_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "Download CSV",
-                data=csv,
-                file_name=f"retention_report_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
+        with col6:
+            st.metric(
+                "Week 4 Retention",
+                f"{retention_summary.get('week_4_retention', 0):.1f}%",
+                f"{retention_summary.get('week_4_eligible_users', 0):,} eligible"
             )
 
+        median_days = retention_summary.get('median_days_to_first_trip')
+        if median_days is not None:
+            st.caption(f"Median time to first trip: {median_days:.1f} days.")
+
+        st.markdown("---")
+        st.markdown("### ⚡ Activation Breakdown")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            activation_chart_df = activation_breakdown_df.copy()
+            activation_chart_df['label'] = activation_chart_df.apply(
+                lambda row: f"{int(row['users']):,} users ({row['rate']:.1f}%)",
+                axis=1
+            )
+            fig = px.bar(
+                activation_chart_df,
+                x='milestone',
+                y='users',
+                text='label',
+                color='rate',
+                color_continuous_scale='Blues',
+                title="Activation Milestones"
+            )
+            fig.update_traces(textposition='outside')
+            fig.update_layout(
+                xaxis_title="Milestone",
+                yaxis_title="Users",
+                coloraxis_colorbar_title="Rate %",
+                height=380,
+                showlegend=False
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
         with col2:
-            st.info("💡 **Pro Tip:** Monitor these metrics weekly to track retention improvements and identify trends early.")
+            if activation_dist_df.empty:
+                st.info("No first-trip timing data available yet.")
+            else:
+                fig = px.bar(
+                    activation_dist_df,
+                    x='days_to_first_trip',
+                    y='users',
+                    title="Time to First Trip Distribution",
+                    labels={
+                        'days_to_first_trip': 'Days from Registration to First Trip',
+                        'users': 'Users'
+                    },
+                    color='users',
+                    color_continuous_scale='Teal'
+                )
+                fig.update_layout(height=380, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+        if not cohort_summary_df.empty:
+            st.markdown("#### Activation by Registration Week")
+            display_cohort_df = cohort_summary_df.copy()
+            display_cohort_df['registration_week'] = pd.to_datetime(
+                display_cohort_df['registration_week'], errors='coerce', utc=True
+            ).dt.strftime('%Y-%m-%d')
+            display_cohort_df.rename(columns={
+                'registration_week': 'Registration Week',
+                'total_users': 'Users',
+                'users_1_trip': '1+ Trips',
+                'users_3_trips': '3+ Trips',
+                'users_7_day': '7-Day Activation',
+                'rate_1_trip': '1+ Trip Rate',
+                'rate_3_trips': '3+ Trip Rate',
+                'rate_7_day': '7-Day Rate'
+            }, inplace=True)
+            for rate_col in ['1+ Trip Rate', '3+ Trip Rate', '7-Day Rate']:
+                display_cohort_df[rate_col] = display_cohort_df[rate_col].map(lambda value: f"{value:.1f}%")
+
+            st.dataframe(
+                display_cohort_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Users": st.column_config.NumberColumn(format="%d"),
+                    "1+ Trips": st.column_config.NumberColumn(format="%d"),
+                    "3+ Trips": st.column_config.NumberColumn(format="%d"),
+                    "7-Day Activation": st.column_config.NumberColumn(format="%d"),
+                }
+            )
+
+        st.markdown("---")
+        st.markdown("### 🗓️ Weekly Retention Cohorts")
+
+        if weekly_retention_df.empty:
+            st.info("Not enough post-signup trip activity yet to build retention cohorts.")
+        else:
+            retention_matrix = (
+                weekly_retention_df.pivot(
+                    index='registration_week',
+                    columns='weeks_since_registration',
+                    values='retention_rate'
+                )
+                .sort_index(ascending=False)
+                .head(12)
+            )
+            max_week = int(retention_matrix.columns.max()) if len(retention_matrix.columns) > 0 else 0
+            weeks_to_show = list(range(0, min(max_week, 7) + 1))
+            retention_matrix = retention_matrix.reindex(columns=weeks_to_show)
+
+            heatmap_y = [
+                pd.to_datetime(value, errors='coerce', utc=True).strftime('%Y-%m-%d')
+                for value in retention_matrix.index
+            ]
+            heatmap_x = [f"Week {int(value)}" for value in retention_matrix.columns]
+
+            fig = go.Figure(
+                data=go.Heatmap(
+                    z=retention_matrix.values,
+                    x=heatmap_x,
+                    y=heatmap_y,
+                    colorscale='Blues',
+                    zmin=0,
+                    zmax=100,
+                    colorbar=dict(title='Retention %'),
+                    hovertemplate="Registration Week %{y}<br>%{x}: %{z:.1f}%<extra></extra>"
+                )
+            )
+            fig.update_layout(
+                height=420,
+                xaxis_title="Weeks Since Signup",
+                yaxis_title="Registration Week"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            display_retention_df = retention_matrix.copy()
+            display_retention_df.index = heatmap_y
+            display_retention_df = display_retention_df.rename_axis('Registration Week').reset_index()
+            display_retention_df.rename(
+                columns={col: f"Week {int(col)}" for col in retention_matrix.columns},
+                inplace=True
+            )
+            for col in display_retention_df.columns[1:]:
+                display_retention_df[col] = display_retention_df[col].apply(
+                    lambda value: f"{value:.1f}%" if pd.notna(value) else "-"
+                )
+
+            st.dataframe(display_retention_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        report_df = pd.DataFrame([
+            {'Metric': 'Registered Users', 'Value': retention_summary.get('total_registered', 0)},
+            {'Metric': '1+ Trips Activation (%)', 'Value': retention_summary.get('activation_1_trip_rate', 0)},
+            {'Metric': '3+ Trips Activation (%)', 'Value': retention_summary.get('activation_3_trip_rate', 0)},
+            {'Metric': '7-Day Activation (%)', 'Value': retention_summary.get('activation_7_day_rate', 0)},
+            {'Metric': 'Week 1 Retention (%)', 'Value': retention_summary.get('week_1_retention', 0)},
+            {'Metric': 'Week 4 Retention (%)', 'Value': retention_summary.get('week_4_retention', 0)},
+            {'Metric': 'Median Days to First Trip', 'Value': retention_summary.get('median_days_to_first_trip', '')}
+        ])
+        st.download_button(
+            "Download Activation & Retention Summary",
+            data=report_df.to_csv(index=False).encode('utf-8'),
+            file_name=f"activation_retention_summary_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
 
     with tab7:
         st.subheader("🗺️ Global Destinations Map")
@@ -2422,6 +2926,78 @@ def main():
 
     with tab8:
         st.subheader("🔧 Advanced Analytics & Insights")
+
+        behavior_lookback_days = st.selectbox(
+            "Behavior comparison window",
+            options=[7, 14, 30, 60, 90, 180],
+            index=2,
+            key="segment_behavior_window"
+        )
+
+        st.markdown("### 👤 Free vs Premium Behavior")
+        segment_behavior_df = get_subscription_segment_behavior(supabase, behavior_lookback_days)
+
+        if segment_behavior_df.empty:
+            st.info("No subscription segment behavior data available.")
+        else:
+            def get_segment_metric(segment_name, column_name):
+                segment_row = segment_behavior_df[segment_behavior_df['Segment'] == segment_name]
+                if segment_row.empty:
+                    return 0
+                return float(segment_row.iloc[0][column_name])
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Free Active Rate", f"{get_segment_metric('Free', 'Active Rate'):.1f}%")
+            with col2:
+                st.metric("Premium Active Rate", f"{get_segment_metric('Premium', 'Active Rate'):.1f}%")
+            with col3:
+                st.metric("Free Avg Trips/User", f"{get_segment_metric('Free', 'Avg Trips/User'):.1f}")
+            with col4:
+                st.metric("Premium Avg Trips/User", f"{get_segment_metric('Premium', 'Avg Trips/User'):.1f}")
+
+            comparison_chart_df = pd.concat([
+                segment_behavior_df[['Segment', 'Active Rate']].rename(columns={'Active Rate': 'Value'}).assign(Metric='Active Rate (%)'),
+                segment_behavior_df[['Segment', '3+ Trip Rate']].rename(columns={'3+ Trip Rate': 'Value'}).assign(Metric='3+ Trip Rate (%)'),
+                segment_behavior_df[['Segment', 'Avg Trips/User']].rename(columns={'Avg Trips/User': 'Value'}).assign(Metric='Avg Trips/User'),
+                segment_behavior_df[['Segment', 'Avg Tracked Events/User']].rename(columns={'Avg Tracked Events/User': 'Value'}).assign(Metric='Tracked Events/User')
+            ], ignore_index=True)
+
+            col1, col2 = st.columns([1.2, 1])
+            with col1:
+                fig = px.bar(
+                    comparison_chart_df,
+                    x='Metric',
+                    y='Value',
+                    color='Segment',
+                    barmode='group',
+                    text='Value',
+                    title=f"Behavior Comparison ({behavior_lookback_days}-day window)",
+                    color_discrete_map={'Free': '#7A8B99', 'Premium': '#1F9D8B'}
+                )
+                fig.update_traces(texttemplate='%{text:.1f}', textposition='outside')
+                fig.update_layout(height=360, yaxis_title="Value")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col2:
+                display_segment_df = segment_behavior_df.copy()
+                for col in ['Active Rate', '3+ Trip Rate', 'Avg Trips/User', 'Avg Completed Trips/User', 'Avg Tracked Events/User']:
+                    display_segment_df[col] = display_segment_df[col].map(lambda value: round(float(value), 1))
+                st.dataframe(
+                    display_segment_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Users": st.column_config.NumberColumn(format="%d"),
+                        "Active Users": st.column_config.NumberColumn(format="%d"),
+                        "3+ Trip Users": st.column_config.NumberColumn(format="%d"),
+                        "Tracked Events": st.column_config.NumberColumn(format="%d"),
+                        "Paywall Open Users": st.column_config.NumberColumn(format="%d"),
+                        "Purchase Start Users": st.column_config.NumberColumn(format="%d")
+                    }
+                )
+
+        st.markdown("---")
 
         # Get analytics data
         purpose_df = get_trip_purpose_analytics(supabase)
@@ -3205,6 +3781,58 @@ def main():
                 st.info("No events match the selected filters.")
             else:
                 filtered_df['event_ts'] = pd.to_datetime(filtered_df['event_ts'], errors='coerce', utc=True)
+                funnel_df, paywall_feature_df, has_completed_purchase_events = build_upgrade_conversion_funnel(filtered_df)
+                feature_usage_df = build_feature_usage_summary(filtered_df)
+
+                st.markdown("#### Paywall → Purchase Funnel")
+                if funnel_df.empty or int(funnel_df['Users'].sum()) == 0:
+                    st.info("No paywall or purchase events are present in this filtered view.")
+                else:
+                    paywall_users = int(funnel_df.loc[funnel_df['Stage'] == 'Paywall Opened', 'Users'].iloc[0])
+                    purchase_start_users = int(funnel_df.loc[funnel_df['Stage'] == 'Purchase Started', 'Users'].iloc[0])
+                    purchase_complete_users = int(funnel_df.loc[funnel_df['Stage'] == 'Purchase Completed', 'Users'].iloc[0])
+                    start_rate = (purchase_start_users / paywall_users * 100) if paywall_users > 0 else 0
+                    complete_rate = (purchase_complete_users / paywall_users * 100) if paywall_users > 0 else 0
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Paywall Users", f"{paywall_users:,}")
+                    with col2:
+                        st.metric("Purchase Starts", f"{purchase_start_users:,}", f"{start_rate:.1f}% of paywall")
+                    with col3:
+                        st.metric("Purchases", f"{purchase_complete_users:,}", f"{complete_rate:.1f}% of paywall")
+                    with col4:
+                        st.metric("Funnel Events", f"{int(funnel_df['Events'].sum()):,}")
+
+                    col1, col2 = st.columns([1.5, 1])
+                    with col1:
+                        fig = go.Figure(go.Funnel(
+                            y=funnel_df['Stage'],
+                            x=funnel_df['Users'],
+                            textinfo="value+percent initial",
+                            marker=dict(color=['#4C78A8', '#54A24B', '#F58518'])
+                        ))
+                        fig.update_layout(height=350, margin=dict(l=80, r=30, t=40, b=20))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    with col2:
+                        if paywall_feature_df.empty:
+                            st.info("No paywall-open sources available.")
+                        else:
+                            st.dataframe(
+                                paywall_feature_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Paywall Opens": st.column_config.NumberColumn(format="%d"),
+                                    "Users": st.column_config.NumberColumn(format="%d")
+                                }
+                            )
+
+                    if not has_completed_purchase_events:
+                        st.warning("No purchase-completed events are currently being tracked in this filtered view. The funnel is accurate up to purchase start, but final purchase conversion is under-instrumented.")
+
+                st.markdown("---")
                 
                 # Core KPI row
                 col1, col2, col3, col4, col5 = st.columns(5)
@@ -3237,6 +3865,50 @@ def main():
                 
                 st.caption(f"Trip Export Conversion: {export_completes:,} / {export_attempts:,} ({(export_completes / export_attempts * 100) if export_attempts > 0 else 0:.1f}%)")
                 
+                st.markdown("---")
+
+                st.markdown("#### Tracked Feature Usage")
+                if feature_usage_df.empty:
+                    st.info("No tracked feature usage is available in this filtered view.")
+                else:
+                    col1, col2 = st.columns([1.2, 1])
+                    with col1:
+                        top_feature_chart_df = feature_usage_df.head(10).sort_values('Unique Users', ascending=True)
+                        fig = px.bar(
+                            top_feature_chart_df,
+                            x='Unique Users',
+                            y='Feature',
+                            orientation='h',
+                            color='Events',
+                            text='Unique Users',
+                            title="Top Tracked Features by Unique Users",
+                            color_continuous_scale='Tealgrn'
+                        )
+                        fig.update_traces(texttemplate='%{text}', textposition='outside')
+                        fig.update_layout(height=380, showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    with col2:
+                        display_feature_df = feature_usage_df.head(12).copy()
+                        display_feature_df['Last Seen'] = pd.to_datetime(
+                            display_feature_df['Last Seen'], errors='coerce', utc=True
+                        ).dt.strftime('%Y-%m-%d %H:%M UTC').fillna('-')
+                        st.dataframe(
+                            display_feature_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Events": st.column_config.NumberColumn(format="%d"),
+                                "Unique Users": st.column_config.NumberColumn(format="%d"),
+                                "Free Users": st.column_config.NumberColumn(format="%d"),
+                                "Premium Users": st.column_config.NumberColumn(format="%d"),
+                                "Free Events": st.column_config.NumberColumn(format="%d"),
+                                "Premium Events": st.column_config.NumberColumn(format="%d"),
+                                "Paywall Opens": st.column_config.NumberColumn(format="%d"),
+                                "Purchase Starts": st.column_config.NumberColumn(format="%d")
+                            }
+                        )
+
                 st.markdown("---")
                 
                 # Top trigger and action summaries
