@@ -1,14 +1,17 @@
 """
 Advanced database queries for Mileage Tracker Pro Dashboard
-This module provides optimized SQL queries for complex analytics
+This module is not yet wired into dashboard.py.
+It has been partially aligned with shared dashboard helpers, but several
+methods still rely on full-table reads and should be audited before reuse.
 """
 
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict
 import streamlit as st
-# Import from our enhanced client
-from supabase_client import Client, get_supabase_manager, monitored_query
+
+from dashboard_data import calculate_trip_duration_minutes, normalize_trip_distance
+from supabase_client import Client
 
 class DatabaseQueries:
     """Class to handle all database queries with optimized SQL"""
@@ -25,9 +28,9 @@ class DatabaseQueries:
             # Using Supabase's RPC function capability for complex queries
             # Note: You'll need to create these functions in your Supabase SQL editor
             
-            query = """
+            _sql_template = """
             SELECT 
-                COUNT(DISTINCT u.id) as total_users,
+                COUNT(DISTINCT p.id) as total_users,
                 COUNT(DISTINCT CASE 
                     WHEN t.created_at >= NOW() - INTERVAL '30 days' 
                     THEN t.user_id 
@@ -40,11 +43,12 @@ class DatabaseQueries:
                     WHEN t.created_at >= NOW() - INTERVAL '1 day' 
                     THEN t.user_id 
                 END) as active_users_today
-            FROM users u
-            LEFT JOIN trips t ON u.id = t.user_id
+            FROM profiles p
+            LEFT JOIN trips t ON p.id = t.user_id
             """
             
-            # For now, we'll use the API approach since direct SQL requires RPC functions
+            # For now, we'll use the API approach since direct SQL requires RPC functions.
+            # `_sql_template` is kept as a reference for future RPC/database-side implementation.
             users = self.client.table('profiles').select('id').execute()
             total_users = len(users.data) if users.data else 0
             
@@ -137,6 +141,21 @@ class DatabaseQueries:
             
             trips_df = pd.DataFrame(trips.data)
             trips_df['created_at'] = pd.to_datetime(trips_df['created_at'])
+            trips_df['distance'] = normalize_trip_distance(
+                trips_df.get('actual_distance'),
+                trips_df.get('mileage')
+            )
+            if {'start_time', 'end_time'}.issubset(trips_df.columns):
+                trips_df['duration'] = calculate_trip_duration_minutes(
+                    trips_df['start_time'],
+                    trips_df['end_time']
+                ).fillna(0)
+            elif 'duration' in trips_df.columns:
+                trips_df['duration'] = pd.to_numeric(
+                    trips_df['duration'], errors='coerce'
+                ).fillna(0)
+            else:
+                trips_df['duration'] = pd.Series(0.0, index=trips_df.index)
             
             # Time-based patterns
             trips_df['hour'] = trips_df['created_at'].dt.hour
@@ -195,14 +214,18 @@ class DatabaseQueries:
             
             # Calculate duration from start_time and end_time if available
             if 'start_time' in trips_df.columns and 'end_time' in trips_df.columns:
-                trips_df['start_time'] = pd.to_datetime(trips_df['start_time'], errors='coerce')
-                trips_df['end_time'] = pd.to_datetime(trips_df['end_time'], errors='coerce')
-                trips_df['duration'] = (trips_df['end_time'] - trips_df['start_time']).dt.total_seconds() / 60
+                trips_df['duration'] = calculate_trip_duration_minutes(
+                    trips_df['start_time'],
+                    trips_df['end_time']
+                ).fillna(0)
             else:
                 trips_df['duration'] = 0
             
             # Use actual_distance if available, otherwise use mileage
-            trips_df['distance'] = trips_df['actual_distance'].fillna(trips_df['mileage']).fillna(0)
+            trips_df['distance'] = normalize_trip_distance(
+                trips_df.get('actual_distance'),
+                trips_df.get('mileage')
+            )
             
             # Calculate user metrics
             now = datetime.now()

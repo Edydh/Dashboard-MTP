@@ -11,6 +11,8 @@ A comprehensive real-time analytics dashboard for monitoring user activity, trip
 
 ### Dashboard Tabs
 
+The current dashboard exposes 12 tabs. The main views are summarized below.
+
 #### 1. **📊 Overview**
 - Total users count with active user metrics
 - Top 10 most active users with detailed statistics
@@ -51,6 +53,14 @@ A comprehensive real-time analytics dashboard for monitoring user activity, trip
 - Time-to-first-trip distribution
 - Weekly cohort analysis
 - Smart recommendations based on retention data
+
+#### Additional Current Views
+- **💸 Expenses**: Expense totals, reimbursements, and related operational analytics
+- **🗺️ Destinations Map**: Destination and trip-location views
+- **🔧 Advanced Analytics**: Deeper derived metrics and supporting analysis
+- **🆕 New Users**: Recent signup and early-activation analysis
+- **🗓️ Trip Logs**: Day/week trip logs with user detail
+- **🚀 Upgrade Signals**: Paywall, purchase funnel, and tracked feature-usage views
 
 ## 🚀 Quick Start
 
@@ -93,10 +103,13 @@ pip install -r requirements.txt
 1. Create a `.env` file in the project root:
 ```env
 SUPABASE_URL=your_supabase_project_url
-SUPABASE_KEY=your_supabase_anon_key
+SUPABASE_KEY=your_supabase_service_role_key
 ```
 
-2. Ensure your Supabase database has the required tables:
+2. Use a Supabase service role key, not an anon key.
+   The dashboard reads the Supabase Auth Admin API via `auth.admin.list_users()`, so anon/public keys are not sufficient for the full dashboard experience.
+
+3. Ensure your Supabase database has the required tables:
 - `profiles` - User profiles with subscription information
 - `trips` - Trip records with mileage and duration data
 
@@ -110,12 +123,17 @@ SUPABASE_KEY=your_supabase_anon_key
 #### Manual Method
 ```bash
 source venv/bin/activate  # Activate virtual environment
-streamlit run dashboard.py
+streamlit run dashboard.py --server.address localhost
 ```
 
 The dashboard will be available at:
 - Local: http://localhost:8501
-- Network: http://192.168.x.x:8501 (your local network IP)
+
+If you intentionally want LAN access, opt in explicitly:
+
+```bash
+streamlit run dashboard.py --server.address 0.0.0.0
+```
 
 ## 📁 Project Structure
 
@@ -140,7 +158,13 @@ Dashboard-MTP/
 - **Data Processing**: Pandas 2.2.2
 - **Visualizations**: Plotly 5.24.1
 - **Environment Management**: python-dotenv
-- **Additional Libraries**: NumPy, Altair, Streamlit-extras
+- **Additional Libraries**: NumPy, Streamlit-extras
+
+## Security Notes
+
+- `SUPABASE_KEY` must be kept server-side only. Do not expose it to client-side code or publish it in frontend assets.
+- The current dashboard expects a service role key because it reads Supabase Auth Admin users.
+- The launcher defaults to `localhost` to avoid unintentionally exposing the dashboard on the local network.
 
 ## 📊 Database Schema
 

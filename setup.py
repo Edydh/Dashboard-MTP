@@ -10,9 +10,9 @@ import subprocess
 from pathlib import Path
 
 def check_python_version():
-    """Check if Python version is 3.8 or higher"""
-    if sys.version_info < (3, 8):
-        print("❌ Error: Python 3.8 or higher is required")
+    """Check if Python version is 3.9 or higher"""
+    if sys.version_info < (3, 9):
+        print("❌ Error: Python 3.9 or higher is required")
         print(f"   Current version: {sys.version}")
         sys.exit(1)
     print(f"✅ Python version: {sys.version.split()[0]}")
@@ -82,14 +82,12 @@ def setup_environment():
         return
     
     print("\n🔧 Setting up environment variables...")
-    
-    # Read example file
-    with open(env_example, 'r') as f:
-        content = f.read()
-    
+
     # Get Supabase credentials
     print("\n📝 Please enter your Supabase credentials:")
     print("   (You can find these in your Supabase project settings)")
+    print("   The dashboard currently requires a service role key because it")
+    print("   reads Supabase Auth Admin users via auth.admin.list_users().")
     
     supabase_url = input("\n   Supabase URL (e.g., https://xxxxx.supabase.co): ").strip()
     supabase_key = input("   Supabase Service Role Key: ").strip()
@@ -131,86 +129,32 @@ def test_connection():
         
         client = create_client(url, key)
         
-        # Try to fetch users count
-        response = client.table('users').select('id', count='exact').execute()
-        
-        print(f"✅ Connection successful! Found {response.count} users in database")
+        # Verify the dashboard's current data path and admin requirements.
+        profiles_response = client.table('profiles').select('id', count='exact').limit(1).execute()
+        client.auth.admin.list_users(page=1, per_page=1)
+
+        print(
+            "✅ Connection successful! "
+            f"Found {profiles_response.count or 0} profiles and confirmed Auth Admin access."
+        )
         return True
         
     except Exception as e:
         print(f"❌ Connection failed: {str(e)}")
         print("\n   Please check:")
         print("   1. Your Supabase URL and Key are correct")
-        print("   2. The 'users' table exists in your database")
+        print("   2. The 'profiles' table exists in your database")
         print("   3. You're using the service role key (not anon key)")
+        print("   4. The service role key has Auth Admin access")
         return False
 
 def create_sample_data():
-    """Option to create sample data for testing"""
+    """Explain the current status of sample data creation."""
     print("\n📊 Sample Data Setup")
-    response = input("   Would you like to create sample data for testing? (y/n): ").lower()
-    
-    if response != 'y':
-        return
-    
-    try:
-        from dotenv import load_dotenv
-        from supabase import create_client
-        from datetime import datetime, timedelta
-        import random
-        import uuid
-        
-        load_dotenv()
-        
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_KEY")
-        
-        client = create_client(url, key)
-        
-        print("\n   Creating sample data...")
-        
-        # Create sample users
-        sample_users = []
-        for i in range(20):
-            user = {
-                'id': str(uuid.uuid4()),
-                'email': f'user{i+1}@example.com',
-                'name': f'Test User {i+1}',
-                'created_at': (datetime.now() - timedelta(days=random.randint(30, 180))).isoformat()
-            }
-            sample_users.append(user)
-        
-        # Insert users
-        client.table('users').insert(sample_users).execute()
-        
-        # Create sample trips
-        sample_trips = []
-        for user in sample_users[:15]:  # Only 15 users have trips
-            num_trips = random.randint(1, 50)
-            for _ in range(num_trips):
-                trip = {
-                    'id': str(uuid.uuid4()),
-                    'user_id': user['id'],
-                    'distance': round(random.uniform(1, 100), 2),
-                    'duration': random.randint(5, 180),
-                    'created_at': (datetime.now() - timedelta(
-                        days=random.randint(0, 30),
-                        hours=random.randint(0, 23),
-                        minutes=random.randint(0, 59)
-                    )).isoformat()
-                }
-                sample_trips.append(trip)
-        
-        # Insert trips in batches
-        batch_size = 100
-        for i in range(0, len(sample_trips), batch_size):
-            batch = sample_trips[i:i+batch_size]
-            client.table('trips').insert(batch).execute()
-        
-        print(f"✅ Created {len(sample_users)} users and {len(sample_trips)} trips")
-        
-    except Exception as e:
-        print(f"❌ Error creating sample data: {str(e)}")
+    print("   Automated sample-data generation is currently disabled.")
+    print("   The dashboard relies on your existing Supabase auth/profiles setup,")
+    print("   so safe seed data needs schema-aware tooling.")
+    print("   Use your Supabase seed flow or project-specific SQL scripts instead.")
 
 def main():
     """Main setup process"""
@@ -237,10 +181,10 @@ def main():
     print("\n" + "=" * 40)
     print("✅ Setup complete!")
     print("\n📊 To start the dashboard, run:")
-    print("   streamlit run dashboard.py")
+    print("   streamlit run dashboard.py --server.address localhost")
     print("\n💡 Tips:")
     print("   - Check README.md for detailed documentation")
-    print("   - Use database_queries.py for advanced analytics")
+    print("   - Use a service role key for full dashboard functionality")
     print("   - Enable auto-refresh in the sidebar for real-time updates")
 
 if __name__ == "__main__":

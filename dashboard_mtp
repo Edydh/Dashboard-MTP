@@ -31,7 +31,8 @@ source venv/bin/activate
 if [ ! -f ".env" ]; then
     echo "⚠️  Warning: .env file not found. Please create one with your Supabase credentials:"
     echo "   SUPABASE_URL=your_supabase_url"
-    echo "   SUPABASE_KEY=your_supabase_anon_key"
+    echo "   SUPABASE_KEY=your_supabase_service_role_key"
+    echo "   (The dashboard uses the Supabase Auth Admin API, so an anon key is not enough.)"
     echo ""
     echo "Continuing anyway..."
 fi
@@ -39,9 +40,10 @@ fi
 # Start the dashboard
 echo "🚀 Launching dashboard..."
 echo "📱 Dashboard will be available at: http://localhost:8501"
-echo "🌐 Network access: http://192.168.x.x:8501"
+echo "🔒 Default binding: localhost only"
+echo "🌐 For intentional LAN access, run: streamlit run dashboard.py --server.address 0.0.0.0"
 echo ""
 echo "Press Ctrl+C to stop the dashboard"
 echo "=============================================="
 
-streamlit run dashboard.py
+streamlit run dashboard.py --server.address localhost

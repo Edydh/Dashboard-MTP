@@ -8,10 +8,33 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import os
 from dotenv import load_dotenv
 import numpy as np
 from streamlit_extras.metric_cards import style_metric_cards
+from dashboard_analytics import (
+    build_feature_usage_summary,
+    build_fuel_efficiency_analytics,
+    build_trip_purpose_analytics,
+    build_upgrade_conversion_funnel,
+)
+from dashboard_data import (
+    calculate_trip_duration_minutes,
+    get_profile_dataset,
+    get_trip_activity_dataset,
+    get_trip_metrics_dataset,
+    get_trips_dataframe,
+    normalize_trip_distance,
+    parse_mixed_timestamp_series,
+)
+from dashboard_metrics import (
+    build_growth_metrics,
+    build_revenue_metrics,
+    build_subscription_segment_behavior_summary,
+    build_trip_statistics,
+    build_user_retention_outputs,
+    build_usage_patterns,
+    build_users_at_risk_summary,
+)
 # Import from our custom client manager
 from supabase_client import get_supabase_client, get_supabase_manager, Client
 
@@ -103,34 +126,6 @@ def get_power_user_count(_supabase: Client, min_trips: int = 10):
         return 0
 
 @st.cache_data(ttl=300)
-def get_trips_dataframe(_supabase: Client, columns: str, created_at_gte=None):
-    """Fetch all trips for the requested columns using pagination."""
-    try:
-        all_rows = []
-        page_size = 1000
-        start = 0
-
-        while True:
-            query = _supabase.table('trips').select(columns).order('created_at', desc=False)
-            if created_at_gte is not None:
-                query = query.gte('created_at', created_at_gte)
-
-            batch = query.range(start, start + page_size - 1).execute().data or []
-            if not batch:
-                break
-
-            all_rows.extend(batch)
-            if len(batch) < page_size:
-                break
-
-            start += page_size
-
-        return pd.DataFrame(all_rows)
-    except Exception as e:
-        st.error(f"Error fetching trip data: {str(e)}")
-        return pd.DataFrame()
-
-@st.cache_data(ttl=300)
 def get_active_users(_supabase: Client, days=30):
     """Get active users in the last N days"""
     try:
@@ -186,9 +181,10 @@ def get_top_active_users(_supabase: Client, limit=10):
             trips_df['duration'] = np.nan
         
         # Use actual_distance if available, otherwise use mileage
-        trips_df['distance'] = pd.to_numeric(trips_df.get('actual_distance'), errors='coerce').fillna(
-            pd.to_numeric(trips_df.get('mileage'), errors='coerce')
-        ).fillna(0)
+        trips_df['distance'] = normalize_trip_distance(
+            trips_df.get('actual_distance'),
+            trips_df.get('mileage')
+        )
         
         # Calculate statistics per user
         user_stats = trips_df.groupby('user_id').agg({
@@ -231,21 +227,9 @@ def get_top_active_users(_supabase: Client, limit=10):
 def get_usage_patterns(_supabase: Client):
     """Get usage patterns over time"""
     try:
-        # Get trips from last 30 days
-        cutoff_date = (datetime.now() - timedelta(days=30)).isoformat()
-        df = get_trips_dataframe(_supabase, 'created_at, user_id', created_at_gte=cutoff_date)
-
-        if df.empty:
-            return pd.DataFrame()
-
-        # Normalize timestamps to UTC and then drop tz for grouping consistency
-        df['created_at'] = pd.to_datetime(df['created_at'], utc=True)
-        df['date'] = df['created_at'].dt.date
-        df['hour'] = df['created_at'].dt.hour
-        df['day_of_week'] = df['created_at'].dt.day_name()
-        
-        return df
-        
+        cutoff_date = (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=30)).isoformat()
+        trips_df = get_trip_metrics_dataset(_supabase, created_at_gte=cutoff_date)
+        return build_usage_patterns(trips_df)
     except Exception as e:
         st.error(f"Error fetching usage patterns: {str(e)}")
         return pd.DataFrame()
@@ -254,45 +238,8 @@ def get_usage_patterns(_supabase: Client):
 def get_trip_statistics(_supabase: Client):
     """Get overall trip statistics"""
     try:
-        df = get_trips_dataframe(
-            _supabase,
-            'mileage, actual_distance, start_time, end_time, created_at'
-        )
-
-        if df.empty:
-            return {}
- 
-        # Calculate duration from start_time and end_time if available
-        if 'start_time' in df.columns and 'end_time' in df.columns:
-            df['duration'] = calculate_trip_duration_minutes(
-                df['start_time'],
-                df['end_time']
-            )
-        else:
-            df['duration'] = np.nan
- 
-        # Use actual_distance if available, otherwise use mileage
-        df['distance'] = pd.to_numeric(df.get('actual_distance'), errors='coerce').fillna(
-            pd.to_numeric(df.get('mileage'), errors='coerce')
-        ).fillna(0)
- 
-        # Normalize created_at to UTC for comparisons
-        created_at_utc = pd.to_datetime(df['created_at'], utc=True)
-        now_utc = pd.Timestamp.now(tz='UTC')
-
-        stats = {
-            'total_trips': len(df),
-            'total_distance': df['distance'].sum(),
-            'avg_distance': df['distance'].mean(),
-            'total_duration': df['duration'].sum(),
-            'avg_duration': df['duration'].mean(),
-            'trips_today': len(df[created_at_utc.dt.date == now_utc.date()]),
-            'trips_this_week': len(df[created_at_utc >= now_utc - pd.Timedelta(days=7)]),
-            'trips_this_month': len(df[created_at_utc >= now_utc - pd.Timedelta(days=30)])
-        }
-        
-        return stats
-        
+        trips_df = get_trip_metrics_dataset(_supabase)
+        return build_trip_statistics(trips_df)
     except Exception as e:
         st.error(f"Error fetching trip statistics: {str(e)}")
         return {}
@@ -303,726 +250,50 @@ def get_users_at_risk(_supabase: Client, inactivity_days: int = 14):
     Also returns the count of users who never made a trip.
     """
     try:
-        profiles_resp = _supabase.table('profiles').select('id, full_name, phone_number, subscription_tier, created_at').execute()
-
-        profiles_df = pd.DataFrame(profiles_resp.data or [])
-        if profiles_df.empty:
-            return pd.DataFrame(), 0
-
-        trips_df = get_trips_dataframe(_supabase, 'user_id, created_at, mileage, actual_distance')
-        if not trips_df.empty:
-            # Normalize
-            trips_df['created_at'] = pd.to_datetime(trips_df['created_at'], utc=True)
-            trips_df['distance'] = pd.to_numeric(trips_df.get('actual_distance'), errors='coerce').fillna(pd.to_numeric(trips_df.get('mileage'), errors='coerce')).fillna(0)
-            # Aggregate by user
-            agg = trips_df.groupby('user_id').agg(
-                trip_count=('user_id', 'count'),
-                last_trip=('created_at', 'max'),
-                total_distance=('distance', 'sum')
-            ).reset_index()
-        else:
-            agg = pd.DataFrame(columns=['user_id', 'trip_count', 'last_trip', 'total_distance'])
-
-        # Merge with profiles
-        merged = profiles_df.merge(agg, left_on='id', right_on='user_id', how='left')
-        now_utc = pd.Timestamp.now(tz='UTC')
-        merged['days_since_last_trip'] = (now_utc - pd.to_datetime(merged['last_trip'], utc=True)).dt.days
-
-        # Users with no trips
-        never_used_count = int(merged['last_trip'].isna().sum())
-
-        # At risk: last trip older than threshold
-        at_risk = merged[(merged['days_since_last_trip'].notna()) & (merged['days_since_last_trip'] > inactivity_days)].copy()
-
-        # Select columns and sort
-        if not at_risk.empty:
-            at_risk = at_risk[['full_name', 'phone_number', 'subscription_tier', 'trip_count', 'total_distance', 'last_trip', 'days_since_last_trip']]
-            at_risk['total_distance'] = at_risk['total_distance'].fillna(0).round(1)
-            at_risk['trip_count'] = at_risk['trip_count'].fillna(0).astype(int)
-            at_risk = at_risk.sort_values(['days_since_last_trip', 'trip_count'], ascending=[False, False])
-
-        return at_risk, never_used_count
+        profiles_df = get_profile_dataset(_supabase)
+        trips_df = get_trip_metrics_dataset(_supabase)
+        return build_users_at_risk_summary(
+            profiles_df,
+            trips_df,
+            inactivity_days=inactivity_days,
+        )
     except Exception as e:
         st.error(f"Error computing users at risk: {str(e)}")
         return pd.DataFrame(), 0
 
 @st.cache_data(ttl=300)
-def normalize_subscription_tier(series: pd.Series) -> pd.Series:
-    """Normalize subscription tiers so downstream comparisons are consistent."""
-    normalized = series.fillna('free').astype(str).str.strip().str.lower()
-    return normalized.replace({'': 'free', 'nan': 'free', 'none': 'free', 'null': 'free'})
-
-def to_week_start(values) -> pd.Series:
-    """Return the Monday-start week bucket for a datetime-like series."""
-    timestamps = pd.to_datetime(values, errors='coerce', utc=True)
-    return timestamps.dt.normalize() - pd.to_timedelta(timestamps.dt.weekday, unit='D')
-
-@st.cache_data(ttl=300)
-def get_profile_dataset(_supabase: Client):
-    """Fetch profile context used across retention and segmentation views."""
-    try:
-        response = _supabase.table('profiles').select(
-            'id, full_name, phone_number, subscription_tier, created_at'
-        ).execute()
-
-        profiles_df = pd.DataFrame(response.data or [])
-        expected_columns = [
-            'id', 'full_name', 'phone_number', 'subscription_tier', 'created_at'
-        ]
-
-        if profiles_df.empty:
-            return pd.DataFrame(columns=expected_columns + [
-                'subscription_tier_norm', 'subscription_segment'
-            ])
-
-        for col in expected_columns:
-            if col not in profiles_df.columns:
-                profiles_df[col] = None
-
-        profiles_df['id'] = profiles_df['id'].astype(str)
-        profiles_df['created_at'] = pd.to_datetime(
-            profiles_df['created_at'], errors='coerce', utc=True
-        )
-        profiles_df['subscription_tier_norm'] = normalize_subscription_tier(
-            profiles_df['subscription_tier']
-        )
-        profiles_df['subscription_segment'] = np.where(
-            profiles_df['subscription_tier_norm'].eq('free'),
-            'Free',
-            'Premium'
-        )
-
-        return profiles_df[[
-            'id', 'full_name', 'phone_number', 'subscription_tier', 'created_at',
-            'subscription_tier_norm', 'subscription_segment'
-        ]]
-    except Exception as e:
-        st.error(f"Error fetching profiles: {str(e)}")
-        return pd.DataFrame(columns=[
-            'id', 'full_name', 'phone_number', 'subscription_tier', 'created_at',
-            'subscription_tier_norm', 'subscription_segment'
-        ])
-
-@st.cache_data(ttl=300)
-def get_trip_activity_dataset(_supabase: Client):
-    """Fetch a paginated trip activity dataset for retention and segmentation analysis."""
-    try:
-        all_trips = []
-        page_size = 1000
-        offset = 0
-        max_rows = 200000
-
-        while True:
-            response = _supabase.table('trips').select(
-                'id, user_id, created_at, status, mileage, actual_distance'
-            ).order('created_at', desc=False).range(offset, offset + page_size - 1).execute()
-
-            batch = response.data or []
-            if not batch:
-                break
-
-            all_trips.extend(batch)
-            if len(batch) < page_size:
-                break
-
-            offset += page_size
-            if offset >= max_rows:
-                break
-
-        trips_df = pd.DataFrame(all_trips)
-        expected_columns = [
-            'id', 'user_id', 'created_at', 'status', 'mileage', 'actual_distance'
-        ]
-
-        if trips_df.empty:
-            return pd.DataFrame(columns=expected_columns + [
-                'distance', 'status_norm', 'is_completed'
-            ])
-
-        for col in expected_columns:
-            if col not in trips_df.columns:
-                trips_df[col] = None
-
-        trips_df['user_id'] = trips_df['user_id'].astype(str)
-        trips_df['created_at'] = pd.to_datetime(
-            trips_df['created_at'], errors='coerce', utc=True
-        )
-        trips_df = trips_df.dropna(subset=['created_at']).copy()
-
-        actual_distance = (
-            pd.to_numeric(trips_df['actual_distance'], errors='coerce')
-            if 'actual_distance' in trips_df.columns
-            else pd.Series(np.nan, index=trips_df.index)
-        )
-        mileage = (
-            pd.to_numeric(trips_df['mileage'], errors='coerce')
-            if 'mileage' in trips_df.columns
-            else pd.Series(np.nan, index=trips_df.index)
-        )
-        trips_df['distance'] = actual_distance.fillna(mileage).fillna(0)
-        trips_df['status_norm'] = trips_df['status'].fillna('').astype(str).str.strip().str.lower()
-        trips_df['is_completed'] = trips_df['status_norm'].isin({'completed', 'complated'})
-
-        return trips_df[[
-            'id', 'user_id', 'created_at', 'status', 'mileage', 'actual_distance',
-            'distance', 'status_norm', 'is_completed'
-        ]]
-    except Exception as e:
-        st.error(f"Error fetching trip activity dataset: {str(e)}")
-        return pd.DataFrame(columns=[
-            'id', 'user_id', 'created_at', 'status', 'mileage', 'actual_distance',
-            'distance', 'status_norm', 'is_completed'
-        ])
-
-@st.cache_data(ttl=300)
 def get_user_retention_analysis(_supabase: Client):
     """Build activation and weekly retention outputs from registrations and trips."""
-    empty_activation = pd.DataFrame(columns=['milestone', 'users', 'rate'])
-    empty_cohort_summary = pd.DataFrame(columns=[
-        'registration_week', 'total_users', 'users_1_trip', 'users_3_trips',
-        'users_7_day', 'rate_1_trip', 'rate_3_trips', 'rate_7_day'
-    ])
-    empty_weekly = pd.DataFrame()
-    empty_activation_dist = pd.DataFrame(columns=['days_to_first_trip', 'users'])
-
     try:
         profiles_df = get_profile_dataset(_supabase)
         auth_users_df = get_auth_users(_supabase)
         trips_df = get_trip_activity_dataset(_supabase)
-
-        profile_base = profiles_df[[
-            'id', 'full_name', 'phone_number', 'subscription_tier',
-            'subscription_tier_norm', 'subscription_segment', 'created_at'
-        ]].copy() if not profiles_df.empty else pd.DataFrame(columns=[
-            'id', 'full_name', 'phone_number', 'subscription_tier',
-            'subscription_tier_norm', 'subscription_segment', 'created_at'
-        ])
-        profile_base.rename(columns={'created_at': 'profile_created_at'}, inplace=True)
-
-        auth_base = auth_users_df[[
-            'id', 'email', 'created_at', 'email_confirmed_at', 'last_sign_in_at'
-        ]].copy() if not auth_users_df.empty else pd.DataFrame(columns=[
-            'id', 'email', 'created_at', 'email_confirmed_at', 'last_sign_in_at'
-        ])
-        auth_base.rename(columns={'created_at': 'auth_created_at'}, inplace=True)
-
-        if profile_base.empty and auth_base.empty:
-            return {}, empty_activation, empty_cohort_summary, empty_weekly, empty_activation_dist
-
-        if profile_base.empty:
-            users_df = auth_base.copy()
-            users_df['full_name'] = None
-            users_df['phone_number'] = None
-            users_df['subscription_tier'] = 'free'
-            users_df['subscription_tier_norm'] = 'free'
-            users_df['subscription_segment'] = 'Free'
-            users_df['profile_created_at'] = pd.NaT
-        elif auth_base.empty:
-            users_df = profile_base.copy()
-            users_df['email'] = None
-            users_df['auth_created_at'] = pd.NaT
-            users_df['email_confirmed_at'] = pd.NaT
-            users_df['last_sign_in_at'] = pd.NaT
-        else:
-            users_df = profile_base.merge(auth_base, on='id', how='outer')
-
-        users_df['profile_created_at'] = pd.to_datetime(
-            users_df['profile_created_at'], errors='coerce', utc=True
-        )
-        users_df['auth_created_at'] = pd.to_datetime(
-            users_df['auth_created_at'], errors='coerce', utc=True
-        )
-        users_df['registration_at'] = users_df['auth_created_at'].combine_first(
-            users_df['profile_created_at']
-        )
-        users_df = users_df.dropna(subset=['registration_at']).copy()
-
-        if users_df.empty:
-            return {}, empty_activation, empty_cohort_summary, empty_weekly, empty_activation_dist
-
-        users_df['subscription_tier'] = users_df['subscription_tier'].fillna('free')
-        users_df['subscription_tier_norm'] = normalize_subscription_tier(
-            users_df['subscription_tier']
-        )
-        users_df['subscription_segment'] = np.where(
-            users_df['subscription_tier_norm'].eq('free'),
-            'Free',
-            'Premium'
-        )
-        users_df['registration_week'] = to_week_start(users_df['registration_at'])
-
-        if trips_df.empty:
-            total_registered = int(len(users_df))
-            summary = {
-                'total_registered': total_registered,
-                'activation_1_trip_users': 0,
-                'activation_1_trip_rate': 0.0,
-                'activation_3_trip_users': 0,
-                'activation_3_trip_rate': 0.0,
-                'activation_7_day_users': 0,
-                'activation_7_day_rate': 0.0,
-                'week_1_retention': 0.0,
-                'week_4_retention': 0.0,
-                'week_1_eligible_users': 0,
-                'week_4_eligible_users': 0,
-                'median_days_to_first_trip': None
-            }
-            activation_breakdown_df = pd.DataFrame([
-                {'milestone': '1+ Trips', 'users': 0, 'rate': 0.0},
-                {'milestone': '3+ Trips', 'users': 0, 'rate': 0.0},
-                {'milestone': '1st Trip in 7 Days', 'users': 0, 'rate': 0.0}
-            ])
-            return summary, activation_breakdown_df, empty_cohort_summary, empty_weekly, empty_activation_dist
-
-        ordered_trips = trips_df.sort_values(['user_id', 'created_at']).copy()
-        ordered_trips['trip_number'] = ordered_trips.groupby('user_id').cumcount() + 1
-
-        trip_summary_df = ordered_trips.groupby('user_id').agg(
-            total_trips=('id', 'count'),
-            completed_trips=('is_completed', 'sum'),
-            first_trip_at=('created_at', 'min'),
-            last_trip_at=('created_at', 'max')
-        ).reset_index().rename(columns={'user_id': 'id'})
-
-        third_trip_df = (
-            ordered_trips[ordered_trips['trip_number'] == 3][['user_id', 'created_at']]
-            .rename(columns={'user_id': 'id', 'created_at': 'third_trip_at'})
-        )
-
-        user_activity_df = users_df.merge(trip_summary_df, on='id', how='left').merge(
-            third_trip_df, on='id', how='left'
-        )
-        for col in ['total_trips', 'completed_trips']:
-            user_activity_df[col] = pd.to_numeric(
-                user_activity_df[col], errors='coerce'
-            ).fillna(0).astype(int)
-
-        raw_days = (
-            user_activity_df['first_trip_at'] - user_activity_df['registration_at']
-        ).dt.total_seconds() / 86400
-        user_activity_df['days_to_first_trip'] = raw_days.where(
-            user_activity_df['first_trip_at'].notna()
-        ).clip(lower=0)
-        user_activity_df['days_to_first_trip_bucket'] = (
-            np.floor(user_activity_df['days_to_first_trip'])
-            .where(user_activity_df['days_to_first_trip'].notna())
-            .astype('Int64')
-        )
-
-        total_registered = int(len(user_activity_df))
-        users_1_trip = int((user_activity_df['total_trips'] >= 1).sum())
-        users_3_trips = int((user_activity_df['total_trips'] >= 3).sum())
-        users_7_day = int((user_activity_df['days_to_first_trip'] <= 7).sum())
-
-        activation_breakdown_df = pd.DataFrame([
-            {
-                'milestone': '1+ Trips',
-                'users': users_1_trip,
-                'rate': (users_1_trip / total_registered * 100) if total_registered > 0 else 0
-            },
-            {
-                'milestone': '3+ Trips',
-                'users': users_3_trips,
-                'rate': (users_3_trips / total_registered * 100) if total_registered > 0 else 0
-            },
-            {
-                'milestone': '1st Trip in 7 Days',
-                'users': users_7_day,
-                'rate': (users_7_day / total_registered * 100) if total_registered > 0 else 0
-            }
-        ])
-
-        cohort_summary_df = (
-            user_activity_df.groupby('registration_week').agg(
-                total_users=('id', 'count'),
-                users_1_trip=('total_trips', lambda s: int((s >= 1).sum())),
-                users_3_trips=('total_trips', lambda s: int((s >= 3).sum())),
-                users_7_day=('days_to_first_trip', lambda s: int((s <= 7).sum()))
-            )
-            .reset_index()
-            .sort_values('registration_week', ascending=False)
-        )
-
-        for numerator_col, rate_col in [
-            ('users_1_trip', 'rate_1_trip'),
-            ('users_3_trips', 'rate_3_trips'),
-            ('users_7_day', 'rate_7_day')
-        ]:
-            cohort_summary_df[rate_col] = np.where(
-                cohort_summary_df['total_users'] > 0,
-                cohort_summary_df[numerator_col] / cohort_summary_df['total_users'] * 100,
-                0
-            )
-
-        activation_dist_df = (
-            user_activity_df.dropna(subset=['days_to_first_trip_bucket'])
-            .groupby('days_to_first_trip_bucket')['id']
-            .nunique()
-            .reset_index(name='users')
-            .rename(columns={'days_to_first_trip_bucket': 'days_to_first_trip'})
-            .sort_values('days_to_first_trip')
-            .head(30)
-        )
-
-        activity_df = ordered_trips.merge(
-            users_df[['id', 'registration_at', 'registration_week']],
-            left_on='user_id',
-            right_on='id',
-            how='inner'
-        )
-        activity_df = activity_df[
-            activity_df['created_at'] >= activity_df['registration_at']
-        ].copy()
-        activity_df['activity_week'] = to_week_start(activity_df['created_at'])
-        activity_df['weeks_since_registration'] = (
-            (activity_df['activity_week'] - activity_df['registration_week']).dt.days // 7
-        ).astype(int)
-        activity_df = activity_df[activity_df['weeks_since_registration'] >= 0]
-
-        cohort_sizes = users_df.groupby('registration_week')['id'].nunique().sort_index()
-        weekly_retention_df = pd.DataFrame()
-
-        if not activity_df.empty:
-            weekly_retention_df = (
-                activity_df[['user_id', 'registration_week', 'weeks_since_registration']]
-                .drop_duplicates()
-                .groupby(['registration_week', 'weeks_since_registration'])['user_id']
-                .nunique()
-                .reset_index(name='active_users')
-            )
-            weekly_retention_df['cohort_size'] = weekly_retention_df['registration_week'].map(cohort_sizes)
-            weekly_retention_df['retention_rate'] = np.where(
-                weekly_retention_df['cohort_size'] > 0,
-                weekly_retention_df['active_users'] / weekly_retention_df['cohort_size'] * 100,
-                0
-            )
-
-        current_week_start = to_week_start(pd.Series([pd.Timestamp.now(tz='UTC')])).iloc[0]
-
-        def weighted_retention_for_week(week_number: int):
-            eligible_cohorts = cohort_sizes.index[
-                cohort_sizes.index <= (current_week_start - pd.Timedelta(days=7 * week_number))
-            ]
-            eligible_users = int(cohort_sizes.reindex(eligible_cohorts).fillna(0).sum())
-            if eligible_users == 0 or weekly_retention_df.empty:
-                return 0.0, eligible_users
-
-            week_activity = (
-                weekly_retention_df[weekly_retention_df['weeks_since_registration'] == week_number]
-                .set_index('registration_week')['active_users']
-            )
-            retained_users = int(week_activity.reindex(eligible_cohorts).fillna(0).sum())
-            rate = retained_users / eligible_users * 100 if eligible_users > 0 else 0
-            return round(rate, 1), eligible_users
-
-        week_1_retention, week_1_eligible_users = weighted_retention_for_week(1)
-        week_4_retention, week_4_eligible_users = weighted_retention_for_week(4)
-
-        median_days_to_first_trip = (
-            round(float(user_activity_df['days_to_first_trip'].dropna().median()), 1)
-            if user_activity_df['days_to_first_trip'].notna().any()
-            else None
-        )
-
-        summary = {
-            'total_registered': total_registered,
-            'activation_1_trip_users': users_1_trip,
-            'activation_1_trip_rate': round(
-                (users_1_trip / total_registered * 100) if total_registered > 0 else 0, 1
-            ),
-            'activation_3_trip_users': users_3_trips,
-            'activation_3_trip_rate': round(
-                (users_3_trips / total_registered * 100) if total_registered > 0 else 0, 1
-            ),
-            'activation_7_day_users': users_7_day,
-            'activation_7_day_rate': round(
-                (users_7_day / total_registered * 100) if total_registered > 0 else 0, 1
-            ),
-            'week_1_retention': week_1_retention,
-            'week_4_retention': week_4_retention,
-            'week_1_eligible_users': week_1_eligible_users,
-            'week_4_eligible_users': week_4_eligible_users,
-            'median_days_to_first_trip': median_days_to_first_trip
-        }
-
-        return summary, activation_breakdown_df, cohort_summary_df, weekly_retention_df, activation_dist_df
-
+        return build_user_retention_outputs(profiles_df, auth_users_df, trips_df)
     except Exception as e:
         st.error(f"Error calculating retention analysis: {str(e)}")
-        return {}, empty_activation, empty_cohort_summary, empty_weekly, empty_activation_dist
-
-def build_upgrade_conversion_funnel(events_df: pd.DataFrame):
-    """Build a paywall-to-purchase funnel from normalized upgrade events."""
-    empty_funnel = pd.DataFrame(columns=['Stage', 'Users', 'Events', 'Conversion from Previous', 'Conversion from Paywall'])
-    empty_paywall = pd.DataFrame(columns=['Feature', 'Paywall Opens', 'Users'])
-
-    if events_df.empty:
-        return empty_funnel, empty_paywall, False
-
-    analysis_df = events_df.copy()
-    analysis_df['event_name_norm'] = analysis_df['event_name'].fillna('').astype(str).str.strip().str.lower()
-    analysis_df['feature_display'] = analysis_df['feature_display'].fillna('Unknown').replace('', 'Unknown')
-
-    stage_patterns = {
-        'Paywall Opened': ['paywall_opened', 'paywall_viewed', 'paywall_shown', 'paywall_displayed'],
-        'Purchase Started': ['purchase_started', 'checkout_started'],
-        'Purchase Completed': ['purchase_completed', 'purchase_complete', 'purchase_succeeded', 'subscription_purchased']
-    }
-
-    paywall_mask = analysis_df['event_name_norm'].apply(
-        lambda value: any(pattern in value for pattern in stage_patterns['Paywall Opened'])
-    )
-    purchase_start_mask = analysis_df['event_name_norm'].apply(
-        lambda value: any(pattern in value for pattern in stage_patterns['Purchase Started'])
-    )
-    purchase_complete_mask = analysis_df['event_name_norm'].apply(
-        lambda value: any(pattern in value for pattern in stage_patterns['Purchase Completed'])
-    )
-
-    paywall_users = set(analysis_df.loc[paywall_mask, 'user_id'].astype(str))
-    purchase_started_users = set(analysis_df.loc[purchase_start_mask, 'user_id'].astype(str)) & paywall_users
-    purchase_completed_users = set(analysis_df.loc[purchase_complete_mask, 'user_id'].astype(str)) & paywall_users
-
-    funnel_rows = [
-        {
-            'Stage': 'Paywall Opened',
-            'Users': len(paywall_users),
-            'Events': int(paywall_mask.sum())
-        },
-        {
-            'Stage': 'Purchase Started',
-            'Users': len(purchase_started_users),
-            'Events': int((purchase_start_mask & analysis_df['user_id'].astype(str).isin(paywall_users)).sum())
-        },
-        {
-            'Stage': 'Purchase Completed',
-            'Users': len(purchase_completed_users),
-            'Events': int((purchase_complete_mask & analysis_df['user_id'].astype(str).isin(paywall_users)).sum())
-        }
-    ]
-
-    funnel_df = pd.DataFrame(funnel_rows)
-    previous_users = None
-    paywall_user_count = funnel_df.iloc[0]['Users'] if not funnel_df.empty else 0
-    conversion_from_previous = []
-    conversion_from_paywall = []
-
-    for _, row in funnel_df.iterrows():
-        current_users = row['Users']
-        if previous_users in (None, 0):
-            conversion_from_previous.append(100.0 if current_users > 0 else 0.0)
-        else:
-            conversion_from_previous.append(current_users / previous_users * 100)
-
-        if paywall_user_count > 0:
-            conversion_from_paywall.append(current_users / paywall_user_count * 100)
-        else:
-            conversion_from_paywall.append(0.0)
-
-        previous_users = current_users
-
-    funnel_df['Conversion from Previous'] = conversion_from_previous
-    funnel_df['Conversion from Paywall'] = conversion_from_paywall
-
-    paywall_feature_df = (
-        analysis_df[paywall_mask]
-        .groupby('feature_display')
-        .agg(
-            **{
-                'Paywall Opens': ('id', 'count'),
-                'Users': ('user_id', 'nunique')
-            }
-        )
-        .reset_index()
-        .rename(columns={'feature_display': 'Feature'})
-        .sort_values(['Users', 'Paywall Opens'], ascending=[False, False])
-        .head(10)
-    )
-
-    has_completed_purchase_events = bool(funnel_df.loc[
-        funnel_df['Stage'] == 'Purchase Completed', 'Users'
-    ].max() > 0) if not funnel_df.empty else False
-
-    return funnel_df, paywall_feature_df, has_completed_purchase_events
-
-def build_feature_usage_summary(events_df: pd.DataFrame):
-    """Summarize tracked feature usage and split it by free vs premium users."""
-    empty_summary = pd.DataFrame(columns=[
-        'Feature', 'Events', 'Unique Users', 'Free Users', 'Premium Users',
-        'Free Events', 'Premium Events', 'Paywall Opens', 'Purchase Starts', 'Last Seen'
-    ])
-
-    if events_df.empty:
-        return empty_summary
-
-    usage_df = events_df.copy()
-    usage_df['event_name_norm'] = usage_df['event_name'].fillna('').astype(str).str.strip().str.lower()
-    usage_df['feature_display'] = usage_df['feature_display'].fillna('Unknown').replace('', 'Unknown')
-    usage_df['subscription_segment'] = np.where(
-        normalize_subscription_tier(usage_df['subscription_tier']).eq('free'),
-        'Free',
-        'Premium'
-    )
-
-    feature_summary = (
-        usage_df.groupby('feature_display')
-        .agg(
-            **{
-                'Events': ('id', 'count'),
-                'Unique Users': ('user_id', 'nunique'),
-                'Paywall Opens': ('event_name_norm', lambda s: s.str.contains('paywall_opened', na=False).sum()),
-                'Purchase Starts': ('event_name_norm', lambda s: s.str.contains('purchase_started', na=False).sum()),
-                'Last Seen': ('event_ts', 'max')
-            }
-        )
-        .reset_index()
-        .rename(columns={'feature_display': 'Feature'})
-    )
-
-    user_segment_counts = (
-        usage_df[['feature_display', 'user_id', 'subscription_segment']]
-        .drop_duplicates()
-        .groupby(['feature_display', 'subscription_segment'])
-        .size()
-        .unstack(fill_value=0)
-    )
-    event_segment_counts = (
-        usage_df.groupby(['feature_display', 'subscription_segment'])
-        .size()
-        .unstack(fill_value=0)
-    )
-
-    for segment in ['Free', 'Premium']:
-        feature_summary[f'{segment} Users'] = feature_summary['Feature'].map(
-            user_segment_counts.get(segment, pd.Series(dtype='int64'))
-        ).fillna(0).astype(int)
-        feature_summary[f'{segment} Events'] = feature_summary['Feature'].map(
-            event_segment_counts.get(segment, pd.Series(dtype='int64'))
-        ).fillna(0).astype(int)
-
-    feature_summary['Last Seen'] = pd.to_datetime(
-        feature_summary['Last Seen'], errors='coerce', utc=True
-    )
-
-    return feature_summary.sort_values(
-        ['Unique Users', 'Events'], ascending=[False, False]
-    ).reset_index(drop=True)
+        return build_user_retention_outputs(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
 @st.cache_data(ttl=300)
 def get_subscription_segment_behavior(_supabase: Client, lookback_days: int = 30):
     """Compare free vs premium behavior over a configurable lookback window."""
-    empty_summary = pd.DataFrame(columns=[
-        'Segment', 'Users', 'Active Users', 'Active Rate', 'Avg Trips/User',
-        'Avg Completed Trips/User', '3+ Trip Users', '3+ Trip Rate',
-        'Tracked Events', 'Avg Tracked Events/User', 'Paywall Open Users',
-        'Purchase Start Users'
-    ])
-
     try:
         profiles_df = get_profile_dataset(_supabase)
-        if profiles_df.empty:
-            return empty_summary
-
-        cutoff_dt = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=lookback_days)
-        users_df = profiles_df[['id', 'subscription_segment']].copy()
-
         trips_df = get_trip_activity_dataset(_supabase)
-        recent_trips_df = trips_df[trips_df['created_at'] >= cutoff_dt].copy() if not trips_df.empty else pd.DataFrame()
-
-        if recent_trips_df.empty:
-            trip_user_summary = pd.DataFrame(columns=[
-                'id', 'trips', 'completed_trips', 'distance'
-            ])
-        else:
-            trip_user_summary = (
-                recent_trips_df.groupby('user_id')
-                .agg(
-                    trips=('id', 'count'),
-                    completed_trips=('is_completed', 'sum'),
-                    distance=('distance', 'sum')
-                )
-                .reset_index()
-                .rename(columns={'user_id': 'id'})
-            )
-
         events_df = get_upgrade_intent_events(_supabase, lookback_days)
-        if events_df.empty:
-            event_user_summary = pd.DataFrame(columns=[
-                'id', 'tracked_events', 'paywall_opens', 'purchase_starts'
-            ])
-        else:
-            event_analysis_df = events_df.copy()
-            event_analysis_df['event_name_norm'] = event_analysis_df['event_name'].fillna('').astype(str).str.strip().str.lower()
-            event_user_summary = (
-                event_analysis_df.groupby('user_id')
-                .agg(
-                    tracked_events=('id', 'count'),
-                    paywall_opens=('event_name_norm', lambda s: s.str.contains('paywall_opened', na=False).sum()),
-                    purchase_starts=('event_name_norm', lambda s: s.str.contains('purchase_started', na=False).sum())
-                )
-                .reset_index()
-                .rename(columns={'user_id': 'id'})
-            )
-
-        behavior_df = users_df.merge(trip_user_summary, on='id', how='left').merge(
-            event_user_summary, on='id', how='left'
+        return build_subscription_segment_behavior_summary(
+            profiles_df,
+            trips_df,
+            events_df,
+            lookback_days=lookback_days,
         )
-
-        for col in ['trips', 'completed_trips', 'distance', 'tracked_events', 'paywall_opens', 'purchase_starts']:
-            behavior_df[col] = pd.to_numeric(behavior_df[col], errors='coerce').fillna(0)
-
-        behavior_df['is_active'] = behavior_df['trips'] > 0
-        behavior_df['is_power_user'] = behavior_df['trips'] >= 3
-        behavior_df['has_paywall_open'] = behavior_df['paywall_opens'] > 0
-        behavior_df['has_purchase_start'] = behavior_df['purchase_starts'] > 0
-
-        summary_df = (
-            behavior_df.groupby('subscription_segment')
-            .agg(
-                Users=('id', 'count'),
-                Active_Users=('is_active', 'sum'),
-                Avg_Trips_Per_User=('trips', 'mean'),
-                Avg_Completed_Trips_Per_User=('completed_trips', 'mean'),
-                Three_Plus_Trip_Users=('is_power_user', 'sum'),
-                Tracked_Events=('tracked_events', 'sum'),
-                Avg_Tracked_Events_Per_User=('tracked_events', 'mean'),
-                Paywall_Open_Users=('has_paywall_open', 'sum'),
-                Purchase_Start_Users=('has_purchase_start', 'sum')
-            )
-            .reset_index()
-            .rename(columns={'subscription_segment': 'Segment'})
-        )
-
-        summary_df['Active Rate'] = np.where(
-            summary_df['Users'] > 0,
-            summary_df['Active_Users'] / summary_df['Users'] * 100,
-            0
-        )
-        summary_df['3+ Trip Rate'] = np.where(
-            summary_df['Users'] > 0,
-            summary_df['Three_Plus_Trip_Users'] / summary_df['Users'] * 100,
-            0
-        )
-
-        return summary_df[[
-            'Segment', 'Users', 'Active_Users', 'Active Rate',
-            'Avg_Trips_Per_User', 'Avg_Completed_Trips_Per_User',
-            'Three_Plus_Trip_Users', '3+ Trip Rate', 'Tracked_Events',
-            'Avg_Tracked_Events_Per_User', 'Paywall_Open_Users',
-            'Purchase_Start_Users'
-        ]].rename(columns={
-            'Active_Users': 'Active Users',
-            'Avg_Trips_Per_User': 'Avg Trips/User',
-            'Avg_Completed_Trips_Per_User': 'Avg Completed Trips/User',
-            'Three_Plus_Trip_Users': '3+ Trip Users',
-            'Tracked_Events': 'Tracked Events',
-            'Avg_Tracked_Events_Per_User': 'Avg Tracked Events/User',
-            'Paywall_Open_Users': 'Paywall Open Users',
-            'Purchase_Start_Users': 'Purchase Start Users'
-        })
     except Exception as e:
         st.error(f"Error calculating subscription segment behavior: {str(e)}")
-        return empty_summary
+        return build_subscription_segment_behavior_summary(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            lookback_days=lookback_days,
+        )
 
 def format_duration(minutes):
     """Format duration from minutes to readable format"""
@@ -1035,17 +306,6 @@ def format_duration(minutes):
     if hours > 0:
         return f"{hours}h {mins}m"
     return f"{mins}m"
-
-def parse_mixed_timestamp_series(values, utc=True):
-    """Parse timestamp columns that mix fractional and non-fractional ISO strings."""
-    return pd.to_datetime(values, errors='coerce', utc=utc, format='mixed')
-
-def calculate_trip_duration_minutes(start_values, end_values):
-    """Calculate trip duration in minutes and leave unresolved/non-positive values empty."""
-    start_times = parse_mixed_timestamp_series(start_values, utc=True)
-    end_times = parse_mixed_timestamp_series(end_values, utc=True)
-    duration_minutes = (end_times - start_times).dt.total_seconds() / 60
-    return duration_minutes.where(duration_minutes > 0)
 
 def calculate_data_completeness(df):
     """Calculate overall data completeness score"""
@@ -1074,55 +334,8 @@ def calculate_data_completeness(df):
 def get_revenue_metrics(_supabase: Client):
     """Calculate revenue metrics by subscription tier"""
     try:
-        # Get all profiles with subscription tiers
-        profiles = _supabase.table('profiles').select('subscription_tier, created_at').execute().data
-        
-        if not profiles:
-            return {}
-        
-        df = pd.DataFrame(profiles)
-        
-        # Define pricing (you can adjust these based on your actual pricing)
-        pricing = {
-            'free': 0,
-            'basic': 9.99,
-            'premium': 19.99,
-            'pro': 39.99,
-            'enterprise': 99.99
-        }
-        
-        # Calculate metrics
-        tier_counts = df['subscription_tier'].value_counts().to_dict()
-        
-        # Calculate MRR (Monthly Recurring Revenue)
-        mrr = sum(tier_counts.get(tier.lower(), 0) * price 
-                  for tier, price in pricing.items())
-        
-        # Calculate ARR (Annual Recurring Revenue)
-        arr = mrr * 12
-        
-        # Calculate average revenue per user (ARPU)
-        total_users = len(df)
-        arpu = mrr / total_users if total_users > 0 else 0
-        
-        # Tier distribution
-        tier_distribution = {
-            tier: {
-                'count': tier_counts.get(tier, 0),
-                'revenue': tier_counts.get(tier, 0) * pricing.get(tier, 0),
-                'percentage': (tier_counts.get(tier, 0) / total_users * 100) if total_users > 0 else 0
-            }
-            for tier in pricing.keys()
-        }
-        
-        return {
-            'mrr': mrr,
-            'arr': arr,
-            'arpu': arpu,
-            'total_users': total_users,
-            'tier_distribution': tier_distribution,
-            'tier_counts': tier_counts
-        }
+        profiles_df = get_profile_dataset(_supabase)
+        return build_revenue_metrics(profiles_df)
     except Exception as e:
         st.error(f"Error calculating revenue metrics: {str(e)}")
         return {}
@@ -1131,67 +344,9 @@ def get_revenue_metrics(_supabase: Client):
 def get_growth_metrics(_supabase: Client):
     """Calculate growth metrics (WoW, MoM, QoQ)"""
     try:
-        # Get all profiles with creation dates
-        profiles = _supabase.table('profiles').select('created_at').execute().data
-        trips = _supabase.table('trips').select('created_at').execute().data
-        
-        if not profiles:
-            return {}
-        
-        # Convert to DataFrame
-        users_df = pd.DataFrame(profiles)
-        users_df['created_at'] = pd.to_datetime(users_df['created_at'], utc=True)
-        
-        trips_df = pd.DataFrame(trips) if trips else pd.DataFrame()
-        if not trips_df.empty:
-            trips_df['created_at'] = pd.to_datetime(trips_df['created_at'], utc=True)
-        
-        now = pd.Timestamp.now(tz='UTC')
-        
-        # Calculate user growth
-        def calculate_period_growth(df, days_current, days_previous):
-            current_start = now - pd.Timedelta(days=days_current)
-            previous_start = now - pd.Timedelta(days=days_previous)
-            previous_end = now - pd.Timedelta(days=days_current)
-            
-            current_count = len(df[df['created_at'] >= current_start])
-            previous_count = len(df[(df['created_at'] >= previous_start) & 
-                                   (df['created_at'] < previous_end)])
-            
-            if previous_count > 0:
-                growth_rate = ((current_count - previous_count) / previous_count) * 100
-            else:
-                growth_rate = 100 if current_count > 0 else 0
-            
-            return {
-                'current': current_count,
-                'previous': previous_count,
-                'growth_rate': growth_rate
-            }
-        
-        # Week over Week (WoW)
-        wow_users = calculate_period_growth(users_df, 7, 14)
-        wow_trips = calculate_period_growth(trips_df, 7, 14) if not trips_df.empty else {'current': 0, 'previous': 0, 'growth_rate': 0}
-        
-        # Month over Month (MoM)
-        mom_users = calculate_period_growth(users_df, 30, 60)
-        mom_trips = calculate_period_growth(trips_df, 30, 60) if not trips_df.empty else {'current': 0, 'previous': 0, 'growth_rate': 0}
-        
-        # Quarter over Quarter (QoQ)
-        qoq_users = calculate_period_growth(users_df, 90, 180)
-        qoq_trips = calculate_period_growth(trips_df, 90, 180) if not trips_df.empty else {'current': 0, 'previous': 0, 'growth_rate': 0}
-        
-        # Daily growth chart data
-        users_df['date'] = users_df['created_at'].dt.date
-        daily_signups = users_df.groupby('date').size().reset_index(name='signups')
-        daily_signups['cumulative'] = daily_signups['signups'].cumsum()
-        
-        return {
-            'wow': {'users': wow_users, 'trips': wow_trips},
-            'mom': {'users': mom_users, 'trips': mom_trips},
-            'qoq': {'users': qoq_users, 'trips': qoq_trips},
-            'daily_signups': daily_signups.tail(30)  # Last 30 days
-        }
+        profiles_df = get_profile_dataset(_supabase)
+        trips_df = get_trip_metrics_dataset(_supabase)
+        return build_growth_metrics(profiles_df, trips_df)
     except Exception as e:
         st.error(f"Error calculating growth metrics: {str(e)}")
         return {}
@@ -1200,36 +355,8 @@ def get_growth_metrics(_supabase: Client):
 def get_trip_purpose_analytics(_supabase: Client):
     """Analyze trip purposes and their usage patterns"""
     try:
-        response = _supabase.table('trips').select('purpose, user_id, mileage, actual_distance, fuel_used, reimbursement, created_at').execute()
-
-        if not response.data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(response.data)
-
-        # Clean and prepare data
-        df['created_at'] = pd.to_datetime(df['created_at'], utc=True)
-        df['distance'] = df['actual_distance'].fillna(df['mileage']).fillna(0)
-        df['purpose'] = df['purpose'].fillna('Not Specified')
-        df['fuel_used'] = pd.to_numeric(df['fuel_used'], errors='coerce').fillna(0)
-        df['reimbursement'] = pd.to_numeric(df['reimbursement'], errors='coerce').fillna(0)
-
-        # Categorize purposes (you can customize these categories)
-        def categorize_purpose(purpose):
-            purpose_lower = str(purpose).lower()
-            if any(word in purpose_lower for word in ['business', 'meeting', 'client', 'work', 'office', 'conference']):
-                return 'Business'
-            elif any(word in purpose_lower for word in ['personal', 'home', 'shopping', 'doctor', 'family', 'vacation']):
-                return 'Personal'
-            elif any(word in purpose_lower for word in ['delivery', 'pickup', 'service']):
-                return 'Service/Delivery'
-            else:
-                return 'Other'
-
-        df['purpose_category'] = df['purpose'].apply(categorize_purpose)
-
-        return df
-
+        trips_df = get_trip_metrics_dataset(_supabase)
+        return build_trip_purpose_analytics(trips_df)
     except Exception as e:
         st.error(f"Error fetching trip purpose analytics: {str(e)}")
         return pd.DataFrame()
@@ -1238,29 +365,8 @@ def get_trip_purpose_analytics(_supabase: Client):
 def get_fuel_efficiency_analytics(_supabase: Client):
     """Analyze fuel efficiency and costs"""
     try:
-        response = _supabase.table('trips').select('mileage, actual_distance, fuel_used, reimbursement, user_id, created_at, purpose').execute()
-
-        if not response.data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(response.data)
-
-        # Clean and prepare data
-        df['created_at'] = pd.to_datetime(df['created_at'], utc=True)
-        df['distance'] = df['actual_distance'].fillna(df['mileage']).fillna(0)
-        df['fuel_used'] = pd.to_numeric(df['fuel_used'], errors='coerce').fillna(0)
-        df['reimbursement'] = pd.to_numeric(df['reimbursement'], errors='coerce').fillna(0)
-
-        # Calculate fuel efficiency
-        df['mpg'] = df.apply(lambda row: row['distance'] / row['fuel_used'] if row['fuel_used'] > 0 else 0, axis=1)
-
-        # Assume average fuel price (you can make this configurable)
-        avg_fuel_price = 3.50  # USD per gallon
-        df['fuel_cost'] = df['fuel_used'] * avg_fuel_price
-        df['cost_per_mile'] = df['fuel_cost'] / df['distance'] if df['distance'].sum() > 0 else 0
-
-        return df
-
+        trips_df = get_trip_metrics_dataset(_supabase)
+        return build_fuel_efficiency_analytics(trips_df)
     except Exception as e:
         st.error(f"Error fetching fuel efficiency analytics: {str(e)}")
         return pd.DataFrame()
@@ -1774,6 +880,8 @@ def get_auth_users(_supabase: Client):
         per_page = 1000
         
         while True:
+            # This uses the Supabase Auth Admin API and therefore requires a
+            # server-side service role key. Anon/public keys cannot satisfy this path.
             users_batch = _supabase.auth.admin.list_users(page=page, per_page=per_page)
             if not users_batch:
                 break
@@ -3319,14 +2427,14 @@ def main():
         col1, col2 = st.columns(2)
 
         with col1:
-            date_range = st.date_input(
+            st.date_input(
                 "Filter by Date Range",
                 value=(datetime.now() - timedelta(days=30), datetime.now()),
                 key="analytics_date_filter"
             )
 
         with col2:
-            purpose_filter = st.multiselect(
+            st.multiselect(
                 "Filter by Purpose Category",
                 options=['Business', 'Personal', 'Service/Delivery', 'Other'],
                 default=['Business', 'Personal', 'Service/Delivery', 'Other'],
