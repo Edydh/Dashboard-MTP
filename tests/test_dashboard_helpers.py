@@ -13,6 +13,7 @@ from dashboard_data import (
     get_trip_activity_dataset,
     get_trips_dataframe,
     normalize_subscription_tier,
+    prepare_global_destinations_dataset,
     to_week_start,
 )
 
@@ -93,6 +94,39 @@ def test_calculate_trip_duration_minutes_handles_invalid_and_non_positive_values
     assert durations.iloc[0] == 45
     assert math.isnan(durations.iloc[1])
     assert math.isnan(durations.iloc[2])
+
+
+def test_prepare_global_destinations_dataset_parses_mixed_iso_timestamps():
+    destinations_df = pd.DataFrame(
+        [
+            {
+                "description": "Toronto, Canada",
+                "latitude": "43.6532",
+                "longitude": "-79.3832",
+                "usage_count": "7",
+                "created_at": "2026-04-22T17:19:14+00:00",
+                "updated_at": "2026-04-22T17:19:14.123456+00:00",
+                "last_used_at": "2026-04-23T09:05:01+00:00",
+            },
+            {
+                "description": "Invalid Coordinates",
+                "latitude": None,
+                "longitude": "-79.0000",
+                "usage_count": "2",
+                "created_at": "2026-04-22T17:19:14.999999+00:00",
+                "updated_at": "2026-04-22T17:19:15+00:00",
+                "last_used_at": "2026-04-23T09:05:02.654321+00:00",
+            },
+        ]
+    )
+
+    prepared_df = prepare_global_destinations_dataset(destinations_df)
+
+    assert prepared_df["description"].tolist() == ["Toronto, Canada"]
+    assert prepared_df["usage_count"].tolist() == [7]
+    assert prepared_df.iloc[0]["created_at"].isoformat() == "2026-04-22T17:19:14+00:00"
+    assert prepared_df.iloc[0]["updated_at"].isoformat() == "2026-04-22T17:19:14.123456+00:00"
+    assert prepared_df.iloc[0]["last_used_at"].isoformat() == "2026-04-23T09:05:01+00:00"
 
 
 def test_build_upgrade_conversion_funnel_counts_only_paywall_users_downstream():

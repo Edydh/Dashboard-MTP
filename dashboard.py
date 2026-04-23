@@ -25,6 +25,7 @@ from dashboard_data import (
     get_trips_dataframe,
     normalize_trip_distance,
     parse_mixed_timestamp_series,
+    prepare_global_destinations_dataset,
 )
 from dashboard_metrics import (
     build_growth_metrics,
@@ -552,22 +553,7 @@ def get_global_destinations(_supabase: Client):
         if not response.data:
             return pd.DataFrame()
 
-        df = pd.DataFrame(response.data)
-
-        # Convert timestamps
-        df['created_at'] = pd.to_datetime(df['created_at'], utc=True)
-        df['updated_at'] = pd.to_datetime(df['updated_at'], utc=True)
-        df['last_used_at'] = pd.to_datetime(df['last_used_at'], utc=True)
-
-        # Ensure numeric types
-        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-        df['usage_count'] = pd.to_numeric(df['usage_count'], errors='coerce').fillna(0)
-
-        # Remove rows with invalid coordinates
-        df = df.dropna(subset=['latitude', 'longitude'])
-
-        return df
+        return prepare_global_destinations_dataset(pd.DataFrame(response.data))
 
     except Exception as e:
         st.error(f"Error fetching global destinations: {str(e)}")

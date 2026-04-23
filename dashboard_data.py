@@ -48,6 +48,16 @@ TRIP_METRICS_DATASET_COLUMNS = [
     "reimbursement",
 ]
 
+GLOBAL_DESTINATIONS_DATASET_COLUMNS = [
+    "description",
+    "latitude",
+    "longitude",
+    "usage_count",
+    "created_at",
+    "updated_at",
+    "last_used_at",
+]
+
 
 def normalize_subscription_tier(series: pd.Series) -> pd.Series:
     """Normalize subscription tiers so downstream comparisons are consistent."""
@@ -163,6 +173,31 @@ def _empty_trip_activity_dataset() -> pd.DataFrame:
 
 def _empty_trip_metrics_dataset() -> pd.DataFrame:
     return pd.DataFrame(columns=TRIP_METRICS_DATASET_COLUMNS)
+
+
+def prepare_global_destinations_dataset(destinations_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize global destinations rows for the Destinations Map view."""
+    if destinations_df.empty:
+        return pd.DataFrame(columns=GLOBAL_DESTINATIONS_DATASET_COLUMNS)
+
+    prepared_df = destinations_df.copy()
+    for col in GLOBAL_DESTINATIONS_DATASET_COLUMNS:
+        if col not in prepared_df.columns:
+            prepared_df[col] = None
+
+    for timestamp_col in ("created_at", "updated_at", "last_used_at"):
+        prepared_df[timestamp_col] = parse_mixed_timestamp_series(
+            prepared_df[timestamp_col], utc=True
+        )
+
+    prepared_df["latitude"] = pd.to_numeric(prepared_df["latitude"], errors="coerce")
+    prepared_df["longitude"] = pd.to_numeric(prepared_df["longitude"], errors="coerce")
+    prepared_df["usage_count"] = pd.to_numeric(
+        prepared_df["usage_count"], errors="coerce"
+    ).fillna(0)
+    prepared_df = prepared_df.dropna(subset=["latitude", "longitude"]).copy()
+
+    return prepared_df
 
 
 def prepare_trip_metrics_dataset(trips_df: pd.DataFrame) -> pd.DataFrame:
