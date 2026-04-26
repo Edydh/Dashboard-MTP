@@ -7,6 +7,7 @@ from dashboard_analytics import (
     build_fuel_efficiency_analytics,
     build_trip_purpose_analytics,
     build_upgrade_conversion_funnel,
+    build_upgrade_purchase_summary,
 )
 from dashboard_data import (
     calculate_trip_duration_minutes,
@@ -158,6 +159,28 @@ def test_build_upgrade_conversion_funnel_counts_only_paywall_users_downstream():
         {"Feature": "Exports", "Paywall Opens": 2, "Users": 2},
         {"Feature": "Routes", "Paywall Opens": 1, "Users": 1},
     ]
+
+
+def test_build_upgrade_purchase_summary_counts_generic_and_inferred_completions():
+    events_df = pd.DataFrame(
+        [
+            {"id": "1", "user_id": "u1", "event_name": "subscription_purchased"},
+            {"id": "2", "user_id": "u2", "event_name": "premium_purchase_started", "subscription_tier": "pro_lifetime"},
+            {"id": "3", "user_id": "u3", "event_name": "checkout_started", "subscription_tier": "free"},
+            {"id": "4", "user_id": "u4", "event_name": "paywall_opened", "subscription_tier": "pro_lifetime"},
+        ]
+    )
+
+    purchase_summary = build_upgrade_purchase_summary(events_df)
+
+    assert purchase_summary == {
+        "purchase_start_users": 2,
+        "purchase_start_events": 2,
+        "purchase_complete_event_users": 1,
+        "purchase_complete_events": 1,
+        "inferred_purchase_complete_users": 1,
+        "observed_purchase_complete_users": 2,
+    }
 
 
 def test_build_feature_usage_summary_splits_free_and_premium_usage():

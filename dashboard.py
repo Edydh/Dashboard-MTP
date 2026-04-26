@@ -16,6 +16,7 @@ from dashboard_analytics import (
     build_fuel_efficiency_analytics,
     build_trip_purpose_analytics,
     build_upgrade_conversion_funnel,
+    build_upgrade_purchase_summary,
 )
 from dashboard_data import (
     calculate_trip_duration_minutes,
@@ -2929,6 +2930,8 @@ def main():
                 st.markdown("---")
                 
                 # Core KPI row
+                purchase_summary = build_upgrade_purchase_summary(filtered_df)
+
                 col1, col2, col3, col4, col5 = st.columns(5)
                 with col1:
                     st.metric("Total Signals", f"{len(filtered_df):,}")
@@ -2939,12 +2942,12 @@ def main():
                 with col4:
                     st.metric("Conversion Events", f"{int((filtered_df['event_kind'] == 'conversion_event').sum()):,}")
                 with col5:
-                    purchase_started = int((filtered_df['event_name'] == 'premium_purchase_started').sum())
+                    purchase_started = purchase_summary["purchase_start_events"]
                     st.metric("Purchase Starts", f"{purchase_started:,}")
                 
                 # Funnel-style summary for common conversion milestones.
-                purchase_start_users = int(filtered_df[filtered_df['event_name'] == 'premium_purchase_started']['user_id'].nunique())
-                purchase_complete_users = int(filtered_df[filtered_df['event_name'] == 'premium_purchase_completed']['user_id'].nunique())
+                purchase_start_users = purchase_summary["purchase_start_users"]
+                purchase_complete_users = purchase_summary["observed_purchase_complete_users"]
                 export_attempts = int((filtered_df['event_name'] == 'trip_export_attempted').sum())
                 export_completes = int((filtered_df['event_name'] == 'trip_export_completed').sum())
                 
@@ -2956,6 +2959,14 @@ def main():
                 with col3:
                     purchase_rate = (purchase_complete_users / purchase_start_users * 100) if purchase_start_users > 0 else 0
                     st.metric("Start → Complete Rate", f"{purchase_rate:.1f}%")
+
+                if purchase_summary["inferred_purchase_complete_users"] > 0:
+                    st.caption(
+                        "Purchase Complete Users includes "
+                        f"{purchase_summary['inferred_purchase_complete_users']} paid-tier user(s) "
+                        "inferred from `subscription_tier` plus a purchase-start signal because no "
+                        "matching purchase-completed event was recorded for them."
+                    )
                 
                 st.caption(f"Trip Export Conversion: {export_completes:,} / {export_attempts:,} ({(export_completes / export_attempts * 100) if export_attempts > 0 else 0:.1f}%)")
                 

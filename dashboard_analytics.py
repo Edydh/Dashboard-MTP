@@ -7,6 +7,17 @@ import pandas as pd
 
 from dashboard_data import normalize_subscription_tier
 
+UPGRADE_STAGE_PATTERNS = {
+    "Paywall Opened": ["paywall_opened", "paywall_viewed", "paywall_shown", "paywall_displayed"],
+    "Purchase Started": ["purchase_started", "checkout_started"],
+    "Purchase Completed": [
+        "purchase_completed",
+        "purchase_complete",
+        "purchase_succeeded",
+        "subscription_purchased",
+    ],
+}
+
 
 def _ensure_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
     result = df.copy() if not df.empty else pd.DataFrame()
@@ -14,6 +25,74 @@ def _ensure_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
         if col not in result.columns:
             result[col] = None
     return result
+
+
+def _prepare_upgrade_analysis_df(events_df: pd.DataFrame) -> pd.DataFrame:
+    analysis_df = _ensure_columns(
+        events_df,
+        ["id", "user_id", "event_name", "feature_display", "subscription_tier"],
+    )
+    if analysis_df.empty:
+        return analysis_df
+
+    analysis_df["user_id"] = analysis_df["user_id"].astype(str)
+    analysis_df["event_name_norm"] = (
+        analysis_df["event_name"].fillna("").astype(str).str.strip().str.lower()
+    )
+    analysis_df["feature_display"] = (
+        analysis_df["feature_display"].fillna("Unknown").replace("", "Unknown")
+    )
+    analysis_df["subscription_tier_norm"] = normalize_subscription_tier(
+        analysis_df["subscription_tier"]
+    )
+    return analysis_df
+
+
+def _build_stage_mask(analysis_df: pd.DataFrame, stage_name: str) -> pd.Series:
+    patterns = UPGRADE_STAGE_PATTERNS[stage_name]
+    return analysis_df["event_name_norm"].apply(
+        lambda value: any(pattern in value for pattern in patterns)
+    )
+
+
+def build_upgrade_purchase_summary(events_df: pd.DataFrame):
+    """Summarize purchase-start and purchase-complete users from upgrade signals."""
+    empty_summary = {
+        "purchase_start_users": 0,
+        "purchase_start_events": 0,
+        "purchase_complete_event_users": 0,
+        "purchase_complete_events": 0,
+        "inferred_purchase_complete_users": 0,
+        "observed_purchase_complete_users": 0,
+    }
+
+    analysis_df = _prepare_upgrade_analysis_df(events_df)
+    if analysis_df.empty:
+        return empty_summary
+
+    purchase_start_mask = _build_stage_mask(analysis_df, "Purchase Started")
+    purchase_complete_mask = _build_stage_mask(analysis_df, "Purchase Completed")
+
+    purchase_start_user_ids = set(analysis_df.loc[purchase_start_mask, "user_id"])
+    purchase_complete_event_user_ids = set(analysis_df.loc[purchase_complete_mask, "user_id"])
+    paid_tier_user_ids = set(
+        analysis_df.loc[analysis_df["subscription_tier_norm"].ne("free"), "user_id"]
+    )
+    inferred_purchase_complete_user_ids = (
+        paid_tier_user_ids & purchase_start_user_ids
+    ) - purchase_complete_event_user_ids
+    observed_purchase_complete_user_ids = (
+        purchase_complete_event_user_ids | inferred_purchase_complete_user_ids
+    )
+
+    return {
+        "purchase_start_users": len(purchase_start_user_ids),
+        "purchase_start_events": int(purchase_start_mask.sum()),
+        "purchase_complete_event_users": len(purchase_complete_event_user_ids),
+        "purchase_complete_events": int(purchase_complete_mask.sum()),
+        "inferred_purchase_complete_users": len(inferred_purchase_complete_user_ids),
+        "observed_purchase_complete_users": len(observed_purchase_complete_user_ids),
+    }
 
 
 def build_upgrade_conversion_funnel(events_df: pd.DataFrame):
@@ -26,37 +105,15 @@ def build_upgrade_conversion_funnel(events_df: pd.DataFrame):
     if events_df.empty:
         return empty_funnel, empty_paywall, False
 
-    analysis_df = events_df.copy()
-    analysis_df["event_name_norm"] = (
-        analysis_df["event_name"].fillna("").astype(str).str.strip().str.lower()
-    )
-    analysis_df["feature_display"] = analysis_df["feature_display"].fillna("Unknown").replace("", "Unknown")
+    analysis_df = _prepare_upgrade_analysis_df(events_df)
+    paywall_mask = _build_stage_mask(analysis_df, "Paywall Opened")
+    purchase_start_mask = _build_stage_mask(analysis_df, "Purchase Started")
+    purchase_complete_mask = _build_stage_mask(analysis_df, "Purchase Completed")
 
-    stage_patterns = {
-        "Paywall Opened": ["paywall_opened", "paywall_viewed", "paywall_shown", "paywall_displayed"],
-        "Purchase Started": ["purchase_started", "checkout_started"],
-        "Purchase Completed": [
-            "purchase_completed",
-            "purchase_complete",
-            "purchase_succeeded",
-            "subscription_purchased",
-        ],
-    }
-
-    paywall_mask = analysis_df["event_name_norm"].apply(
-        lambda value: any(pattern in value for pattern in stage_patterns["Paywall Opened"])
-    )
-    purchase_start_mask = analysis_df["event_name_norm"].apply(
-        lambda value: any(pattern in value for pattern in stage_patterns["Purchase Started"])
-    )
-    purchase_complete_mask = analysis_df["event_name_norm"].apply(
-        lambda value: any(pattern in value for pattern in stage_patterns["Purchase Completed"])
-    )
-
-    paywall_users = set(analysis_df.loc[paywall_mask, "user_id"].astype(str))
-    purchase_started_users = set(analysis_df.loc[purchase_start_mask, "user_id"].astype(str)) & paywall_users
+    paywall_users = set(analysis_df.loc[paywall_mask, "user_id"])
+    purchase_started_users = set(analysis_df.loc[purchase_start_mask, "user_id"]) & paywall_users
     purchase_completed_users = (
-        set(analysis_df.loc[purchase_complete_mask, "user_id"].astype(str)) & paywall_users
+        set(analysis_df.loc[purchase_complete_mask, "user_id"]) & paywall_users
     )
 
     funnel_rows = [
@@ -68,13 +125,13 @@ def build_upgrade_conversion_funnel(events_df: pd.DataFrame):
         {
             "Stage": "Purchase Started",
             "Users": len(purchase_started_users),
-            "Events": int((purchase_start_mask & analysis_df["user_id"].astype(str).isin(paywall_users)).sum()),
+            "Events": int((purchase_start_mask & analysis_df["user_id"].isin(paywall_users)).sum()),
         },
         {
             "Stage": "Purchase Completed",
             "Users": len(purchase_completed_users),
             "Events": int(
-                (purchase_complete_mask & analysis_df["user_id"].astype(str).isin(paywall_users)).sum()
+                (purchase_complete_mask & analysis_df["user_id"].isin(paywall_users)).sum()
             ),
         },
     ]
