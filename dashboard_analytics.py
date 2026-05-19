@@ -18,6 +18,22 @@ UPGRADE_STAGE_PATTERNS = {
     ],
 }
 
+REVENUECAT_STAGE_MAP = {
+    "INITIAL_PURCHASE": "Purchase",
+    "NON_RENEWING_PURCHASE": "Purchase",
+    "TRIAL_STARTED": "Trial",
+    "RENEWAL": "Renewal",
+    "CANCELLATION": "Cancellation",
+    "UNCANCELLATION": "Uncancellation",
+    "EXPIRATION": "Expiration",
+    "BILLING_ISSUE": "Billing Issue",
+    "PRODUCT_CHANGE": "Product Change",
+    "REFUND": "Refund",
+    "SUBSCRIPTION_PAUSED": "Paused",
+    "TEMPORARY_ENTITLEMENT_GRANT": "Entitlement Grant",
+    "TRANSFER": "Transfer",
+}
+
 
 def _ensure_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
     result = df.copy() if not df.empty else pd.DataFrame()
@@ -25,6 +41,130 @@ def _ensure_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
         if col not in result.columns:
             result[col] = None
     return result
+
+
+def classify_revenuecat_lifecycle_stage(event_type) -> str:
+    """Map RevenueCat event types into lifecycle stages for dashboard display."""
+    normalized_type = str(event_type or "").strip().upper()
+    return REVENUECAT_STAGE_MAP.get(normalized_type, "Other")
+
+
+def build_revenuecat_lifecycle_summary(events_df: pd.DataFrame, app_user_id=None):
+    """Build a user-level RevenueCat lifecycle timeline and conservative state summary."""
+    timeline_columns = [
+        "event_time",
+        "stage",
+        "event_type",
+        "app_user_id",
+        "product_id",
+        "entitlement_display",
+        "store",
+        "environment",
+        "transaction_id",
+        "revenuecat_event_id",
+    ]
+    empty_timeline = pd.DataFrame(columns=timeline_columns)
+    empty_summary = {
+        "events": 0,
+        "app_users": 0,
+        "purchase_events": 0,
+        "renewal_events": 0,
+        "cancellation_events": 0,
+        "expiration_events": 0,
+        "refund_events": 0,
+        "billing_issue_events": 0,
+        "latest_event_type": None,
+        "latest_event_at": None,
+        "latest_product_id": None,
+        "latest_environment": None,
+        "latest_store": None,
+        "current_state": "No events",
+        "state_detail": "No RevenueCat lifecycle events matched the current selection.",
+    }
+
+    if events_df.empty:
+        return empty_timeline, empty_summary
+
+    lifecycle_df = _ensure_columns(
+        events_df,
+        [
+            "event_timestamp",
+            "created_at",
+            "event_type",
+            "app_user_id",
+            "product_id",
+            "entitlement_display",
+            "store",
+            "environment",
+            "transaction_id",
+            "revenuecat_event_id",
+        ],
+    ).copy()
+
+    lifecycle_df["app_user_id"] = lifecycle_df["app_user_id"].astype(str)
+    lifecycle_df = lifecycle_df[lifecycle_df["app_user_id"].str.strip().ne("")]
+    if app_user_id:
+        lifecycle_df = lifecycle_df[lifecycle_df["app_user_id"].eq(str(app_user_id))]
+
+    if lifecycle_df.empty:
+        return empty_timeline, empty_summary
+
+    lifecycle_df["event_time"] = pd.to_datetime(
+        lifecycle_df["event_timestamp"], errors="coerce", utc=True
+    ).combine_first(pd.to_datetime(lifecycle_df["created_at"], errors="coerce", utc=True))
+    lifecycle_df["event_type"] = lifecycle_df["event_type"].fillna("UNKNOWN").astype(str).str.upper()
+    lifecycle_df["stage"] = lifecycle_df["event_type"].apply(classify_revenuecat_lifecycle_stage)
+    lifecycle_df = lifecycle_df.sort_values("event_time", ascending=True, na_position="last")
+
+    timeline_df = lifecycle_df[timeline_columns].reset_index(drop=True)
+
+    stage_counts = timeline_df["stage"].value_counts()
+    latest_row = timeline_df.dropna(subset=["event_time"]).tail(1)
+    if latest_row.empty:
+        latest_row = timeline_df.tail(1)
+    latest = latest_row.iloc[0]
+
+    purchase_events = int(stage_counts.get("Purchase", 0))
+    renewal_events = int(stage_counts.get("Renewal", 0))
+    cancellation_events = int(stage_counts.get("Cancellation", 0))
+    expiration_events = int(stage_counts.get("Expiration", 0))
+    refund_events = int(stage_counts.get("Refund", 0))
+    billing_issue_events = int(stage_counts.get("Billing Issue", 0))
+
+    if refund_events > 0:
+        current_state = "Refunded"
+        state_detail = "A refund event is present. Verify entitlement state before treating this user as active."
+    elif expiration_events > 0:
+        current_state = "Expired"
+        state_detail = "An expiration event is present after the purchase lifecycle began."
+    elif cancellation_events > 0:
+        current_state = "Cancelled"
+        state_detail = "Cancellation was recorded; access may remain active until expiration."
+    elif purchase_events > 0 or renewal_events > 0:
+        current_state = "Active Signal"
+        state_detail = "Purchase or renewal events are present and no cancellation/expiration/refund was found."
+    else:
+        current_state = "No Purchase"
+        state_detail = "No purchase, renewal, cancellation, expiration, or refund signal was found."
+
+    summary = {
+        "events": int(len(timeline_df)),
+        "app_users": int(timeline_df["app_user_id"].nunique()),
+        "purchase_events": purchase_events,
+        "renewal_events": renewal_events,
+        "cancellation_events": cancellation_events,
+        "expiration_events": expiration_events,
+        "refund_events": refund_events,
+        "billing_issue_events": billing_issue_events,
+        "latest_event_type": latest.get("event_type"),
+        "latest_event_at": latest.get("event_time"),
+        "latest_product_id": latest.get("product_id"),
+        "latest_environment": latest.get("environment"),
+        "latest_store": latest.get("store"),
+        "current_state": current_state,
+        "state_detail": state_detail,
+    }
+    return timeline_df, summary
 
 
 def _prepare_upgrade_analysis_df(events_df: pd.DataFrame) -> pd.DataFrame:

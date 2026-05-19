@@ -5,6 +5,7 @@ import pandas as pd
 from dashboard_analytics import (
     build_feature_usage_summary,
     build_fuel_efficiency_analytics,
+    build_revenuecat_lifecycle_summary,
     build_trip_purpose_analytics,
     build_upgrade_conversion_funnel,
     build_upgrade_purchase_summary,
@@ -209,6 +210,81 @@ def test_prepare_revenuecat_events_dataset_prefers_direct_columns_and_sorts_late
 
     assert prepared_df["revenuecat_event_id"].tolist() == ["evt-newer", "evt-older"]
     assert prepared_df["event_type"].tolist() == ["RENEWAL", "INITIAL_PURCHASE"]
+
+
+def test_build_revenuecat_lifecycle_summary_marks_expired_after_cancel_and_expiration():
+    events_df = pd.DataFrame(
+        [
+            {
+                "revenuecat_event_id": "evt-1",
+                "event_type": "INITIAL_PURCHASE",
+                "app_user_id": "user-1",
+                "product_id": "monthly",
+                "entitlement_display": "pro",
+                "store": "play_store",
+                "environment": "sandbox",
+                "transaction_id": "tx-1",
+                "event_timestamp": "2026-05-19T14:22:47Z",
+            },
+            {
+                "revenuecat_event_id": "evt-2",
+                "event_type": "CANCELLATION",
+                "app_user_id": "user-1",
+                "product_id": "monthly",
+                "entitlement_display": "pro",
+                "store": "play_store",
+                "environment": "sandbox",
+                "transaction_id": "tx-1",
+                "event_timestamp": "2026-05-19T14:30:18Z",
+            },
+            {
+                "revenuecat_event_id": "evt-3",
+                "event_type": "EXPIRATION",
+                "app_user_id": "user-1",
+                "product_id": "monthly",
+                "entitlement_display": "pro",
+                "store": "play_store",
+                "environment": "sandbox",
+                "transaction_id": "tx-1",
+                "event_timestamp": "2026-05-19T14:30:19Z",
+            },
+        ]
+    )
+
+    timeline_df, summary = build_revenuecat_lifecycle_summary(events_df, app_user_id="user-1")
+
+    assert timeline_df["stage"].tolist() == ["Purchase", "Cancellation", "Expiration"]
+    assert summary["events"] == 3
+    assert summary["purchase_events"] == 1
+    assert summary["cancellation_events"] == 1
+    assert summary["expiration_events"] == 1
+    assert summary["current_state"] == "Expired"
+    assert summary["latest_event_type"] == "EXPIRATION"
+
+
+def test_build_revenuecat_lifecycle_summary_keeps_cancellation_distinct_from_expiration():
+    events_df = pd.DataFrame(
+        [
+            {
+                "revenuecat_event_id": "evt-1",
+                "event_type": "INITIAL_PURCHASE",
+                "app_user_id": "user-1",
+                "event_timestamp": "2026-05-19T14:22:47Z",
+            },
+            {
+                "revenuecat_event_id": "evt-2",
+                "event_type": "CANCELLATION",
+                "app_user_id": "user-1",
+                "event_timestamp": "2026-05-19T14:30:18Z",
+            },
+        ]
+    )
+
+    _, summary = build_revenuecat_lifecycle_summary(events_df, app_user_id="user-1")
+
+    assert summary["current_state"] == "Cancelled"
+    assert "access may remain active until expiration" in summary["state_detail"]
+    assert summary["expiration_events"] == 0
 
 
 def test_build_upgrade_conversion_funnel_counts_only_paywall_users_downstream():

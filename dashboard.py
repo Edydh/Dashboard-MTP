@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import numpy as np
 from streamlit_extras.metric_cards import style_metric_cards
 from dashboard_analytics import (
+    build_revenuecat_lifecycle_summary,
     build_feature_usage_summary,
     build_fuel_efficiency_analytics,
     build_trip_purpose_analytics,
@@ -1420,6 +1421,121 @@ def main():
                 )
                 fig.update_layout(height=360, showlegend=False, yaxis={'categoryorder': 'total ascending'})
                 st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("---")
+                st.markdown("#### Purchase Lifecycle")
+                st.caption("Cancellation means renewal was stopped; expiration or refund is the stronger access-ended signal.")
+
+                lifecycle_source_df = filtered_revenuecat_df.copy()
+                lifecycle_source_df['app_user_id'] = lifecycle_source_df['app_user_id'].fillna('').astype(str)
+                lifecycle_source_df = lifecycle_source_df[lifecycle_source_df['app_user_id'].str.strip() != '']
+
+                if lifecycle_source_df.empty:
+                    st.info("No app user IDs are available for lifecycle analysis in this filtered view.")
+                else:
+                    user_recency_df = (
+                        lifecycle_source_df.groupby('app_user_id')['_event_time']
+                        .max()
+                        .reset_index()
+                        .sort_values('_event_time', ascending=False, na_position='last')
+                    )
+                    app_user_options = user_recency_df['app_user_id'].tolist()
+                    sandbox_test_user = '1a1a8187-6916-4248-865c-c42271f6393d'
+                    default_user_index = (
+                        app_user_options.index(sandbox_test_user)
+                        if sandbox_test_user in app_user_options
+                        else 0
+                    )
+                    selected_lifecycle_user = st.selectbox(
+                        "App user",
+                        options=app_user_options,
+                        index=default_user_index,
+                        key="revenuecat_lifecycle_user",
+                    )
+
+                    lifecycle_timeline_df, lifecycle_summary = build_revenuecat_lifecycle_summary(
+                        lifecycle_source_df,
+                        app_user_id=selected_lifecycle_user,
+                    )
+
+                    col1, col2, col3, col4, col5, col6 = st.columns(6)
+                    with col1:
+                        st.metric("State", lifecycle_summary["current_state"])
+                    with col2:
+                        st.metric("Events", f"{lifecycle_summary['events']:,}")
+                    with col3:
+                        st.metric("Purchases", f"{lifecycle_summary['purchase_events']:,}")
+                    with col4:
+                        st.metric("Renewals", f"{lifecycle_summary['renewal_events']:,}")
+                    with col5:
+                        st.metric("Cancels", f"{lifecycle_summary['cancellation_events']:,}")
+                    with col6:
+                        st.metric("Expires", f"{lifecycle_summary['expiration_events']:,}")
+
+                    st.caption(lifecycle_summary["state_detail"])
+
+                    latest_lifecycle_time = lifecycle_summary.get("latest_event_at")
+                    if pd.notna(latest_lifecycle_time):
+                        st.caption(
+                            "Latest lifecycle event: "
+                            f"{lifecycle_summary.get('latest_event_type', '-')} at "
+                            f"{pd.to_datetime(latest_lifecycle_time, utc=True).strftime('%Y-%m-%d %H:%M UTC')}"
+                        )
+
+                    if lifecycle_timeline_df.empty:
+                        st.info("No lifecycle events found for the selected app user.")
+                    else:
+                        chart_timeline_df = lifecycle_timeline_df.dropna(subset=['event_time']).copy()
+                        if not chart_timeline_df.empty:
+                            fig = px.scatter(
+                                chart_timeline_df,
+                                x='event_time',
+                                y='stage',
+                                color='stage',
+                                hover_data=['event_type', 'product_id', 'store', 'environment'],
+                                title="Selected User RevenueCat Lifecycle",
+                                labels={'event_time': 'Time', 'stage': 'Lifecycle Stage'},
+                            )
+                            fig.update_traces(marker=dict(size=13))
+                            fig.update_layout(height=300, showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        lifecycle_display_df = lifecycle_timeline_df.copy()
+                        lifecycle_display_df['Time (UTC)'] = pd.to_datetime(
+                            lifecycle_display_df['event_time'],
+                            errors='coerce',
+                            utc=True,
+                        ).dt.strftime('%Y-%m-%d %H:%M:%S').fillna('-')
+                        lifecycle_display_df['Stage'] = lifecycle_display_df['stage'].fillna('-')
+                        lifecycle_display_df['Event Type'] = lifecycle_display_df['event_type'].fillna('-')
+                        lifecycle_display_df['Product'] = lifecycle_display_df['product_id'].fillna('-')
+                        lifecycle_display_df['Entitlements'] = lifecycle_display_df[
+                            'entitlement_display'
+                        ].fillna('-')
+                        lifecycle_display_df['Store'] = lifecycle_display_df['store'].fillna('-')
+                        lifecycle_display_df['Environment'] = lifecycle_display_df['environment'].fillna('-')
+                        lifecycle_display_df['Transaction ID'] = lifecycle_display_df[
+                            'transaction_id'
+                        ].fillna('-')
+                        lifecycle_display_df['RevenueCat Event ID'] = lifecycle_display_df[
+                            'revenuecat_event_id'
+                        ].fillna('-')
+
+                        st.dataframe(
+                            lifecycle_display_df[[
+                                'Time (UTC)', 'Stage', 'Event Type', 'Product', 'Entitlements',
+                                'Store', 'Environment', 'Transaction ID', 'RevenueCat Event ID'
+                            ]],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Time (UTC)": st.column_config.TextColumn(width="medium"),
+                                "Event Type": st.column_config.TextColumn(width="medium"),
+                                "Product": st.column_config.TextColumn(width="medium"),
+                                "Transaction ID": st.column_config.TextColumn(width="large"),
+                                "RevenueCat Event ID": st.column_config.TextColumn(width="large"),
+                            }
+                        )
 
                 st.markdown("---")
                 st.markdown("#### Latest 50 Events")
