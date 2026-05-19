@@ -1341,7 +1341,10 @@ def main():
 
             st.markdown("---")
 
-            environment_options = sorted(monitor_df['environment'].dropna().astype(str).unique().tolist())
+            environment_options = sorted(
+                set(monitor_df['environment'].dropna().astype(str).unique().tolist())
+                | {'sandbox', 'production'}
+            )
             store_options = sorted(monitor_df['store'].dropna().astype(str).unique().tolist())
             event_type_options = sorted(monitor_df['event_type'].dropna().astype(str).unique().tolist())
 
