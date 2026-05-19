@@ -2,6 +2,8 @@
 Shared data-access and normalization helpers for dashboard views.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -58,6 +60,27 @@ GLOBAL_DESTINATIONS_DATASET_COLUMNS = [
     "last_used_at",
 ]
 
+REVENUECAT_EVENT_DATASET_COLUMNS = [
+    "id",
+    "revenuecat_event_id",
+    "event_type",
+    "app_user_id",
+    "aliases",
+    "alias_display",
+    "product_id",
+    "entitlement_ids",
+    "entitlement_display",
+    "store",
+    "environment",
+    "transaction_id",
+    "original_transaction_id",
+    "purchased_at",
+    "expiration_at",
+    "event_timestamp",
+    "created_at",
+    "raw_event",
+]
+
 
 def normalize_subscription_tier(series: pd.Series) -> pd.Series:
     """Normalize subscription tiers so downstream comparisons are consistent."""
@@ -74,6 +97,32 @@ def to_week_start(values) -> pd.Series:
 def parse_mixed_timestamp_series(values, utc=True):
     """Parse timestamp columns that mix fractional and non-fractional ISO strings."""
     return pd.to_datetime(values, errors="coerce", utc=utc, format="mixed")
+
+
+def parse_revenuecat_timestamp_series(values):
+    """Parse RevenueCat timestamp values from ISO strings or millisecond epochs."""
+    values_series = pd.Series(values)
+    numeric_values = pd.to_numeric(values_series, errors="coerce")
+    parsed = pd.to_datetime(values_series, errors="coerce", utc=True, format="mixed")
+
+    numeric_mask = numeric_values.notna()
+    if numeric_mask.any():
+        millisecond_mask = numeric_mask & (numeric_values.abs() > 10_000_000_000)
+        second_mask = numeric_mask & ~millisecond_mask
+        parsed.loc[millisecond_mask] = pd.to_datetime(
+            numeric_values.loc[millisecond_mask],
+            errors="coerce",
+            unit="ms",
+            utc=True,
+        )
+        parsed.loc[second_mask] = pd.to_datetime(
+            numeric_values.loc[second_mask],
+            errors="coerce",
+            unit="s",
+            utc=True,
+        )
+
+    return parsed
 
 
 def normalize_trip_distance(actual_distance_values, mileage_values) -> pd.Series:
@@ -198,6 +247,121 @@ def prepare_global_destinations_dataset(destinations_df: pd.DataFrame) -> pd.Dat
     prepared_df = prepared_df.dropna(subset=["latitude", "longitude"]).copy()
 
     return prepared_df
+
+
+def _empty_revenuecat_events_dataset() -> pd.DataFrame:
+    return pd.DataFrame(columns=REVENUECAT_EVENT_DATASET_COLUMNS)
+
+
+def _extract_revenuecat_event_payload(raw_value):
+    if isinstance(raw_value, dict):
+        event_payload = raw_value.get("event")
+        return event_payload if isinstance(event_payload, dict) else raw_value
+
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            event_payload = parsed.get("event")
+            return event_payload if isinstance(event_payload, dict) else parsed
+
+    return {}
+
+
+def _empty_strings_to_na(series: pd.Series) -> pd.Series:
+    cleaned = series.copy()
+    text_values = cleaned.astype(str).str.strip()
+    return cleaned.where(cleaned.notna() & ~text_values.isin({"", "None", "nan", "null"}), pd.NA)
+
+
+def _format_revenuecat_list(value) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item) for item in value if item is not None) or "-"
+    if isinstance(value, dict):
+        return ", ".join(str(key) for key in value.keys()) or "-"
+    if pd.isna(value) or str(value).strip() == "":
+        return "-"
+    return str(value)
+
+
+def prepare_revenuecat_events_dataset(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize RevenueCat webhook event rows for read-only dashboard monitoring."""
+    if events_df.empty:
+        return _empty_revenuecat_events_dataset()
+
+    prepared_df = events_df.copy()
+    for col in ["id", "raw_event"]:
+        if col not in prepared_df.columns:
+            prepared_df[col] = None
+
+    raw_payloads = prepared_df["raw_event"].apply(_extract_revenuecat_event_payload)
+
+    def raw_field(field_name):
+        return raw_payloads.apply(
+            lambda payload: payload.get(field_name) if isinstance(payload, dict) else None
+        )
+
+    def coalesce(candidates, raw_name=None):
+        result = pd.Series([pd.NA] * len(prepared_df), index=prepared_df.index, dtype="object")
+        for col in candidates:
+            if col in prepared_df.columns:
+                candidate = _empty_strings_to_na(prepared_df[col]).astype("object")
+                missing_mask = result.isna()
+                result.loc[missing_mask] = candidate.loc[missing_mask]
+        if raw_name is not None:
+            candidate = _empty_strings_to_na(raw_field(raw_name)).astype("object")
+            missing_mask = result.isna()
+            result.loc[missing_mask] = candidate.loc[missing_mask]
+        return result
+
+    output_df = pd.DataFrame(index=prepared_df.index)
+    output_df["id"] = prepared_df["id"]
+    output_df["revenuecat_event_id"] = coalesce(
+        ["revenuecat_event_id", "event_id"],
+        raw_name="id",
+    )
+    output_df["event_type"] = coalesce(["event_type", "type"], raw_name="type").fillna("UNKNOWN")
+    output_df["app_user_id"] = coalesce(["app_user_id", "user_id"], raw_name="app_user_id")
+    output_df["aliases"] = coalesce(["aliases"], raw_name="aliases")
+    output_df["product_id"] = coalesce(["product_id"], raw_name="product_id")
+    output_df["entitlement_ids"] = coalesce(["entitlement_ids"], raw_name="entitlement_ids")
+    output_df["store"] = coalesce(["store"], raw_name="store").fillna("unknown")
+    output_df["environment"] = coalesce(["environment"], raw_name="environment").fillna("unknown")
+    output_df["transaction_id"] = coalesce(["transaction_id"], raw_name="transaction_id")
+    output_df["original_transaction_id"] = coalesce(
+        ["original_transaction_id"],
+        raw_name="original_transaction_id",
+    )
+    output_df["purchased_at"] = parse_revenuecat_timestamp_series(
+        coalesce(["purchased_at", "purchased_at_ms"], raw_name="purchased_at_ms")
+    )
+    output_df["expiration_at"] = parse_revenuecat_timestamp_series(
+        coalesce(["expiration_at", "expiration_at_ms"], raw_name="expiration_at_ms")
+    )
+    output_df["event_timestamp"] = parse_revenuecat_timestamp_series(
+        coalesce(["event_timestamp", "event_timestamp_ms"], raw_name="event_timestamp_ms")
+    )
+    output_df["created_at"] = parse_revenuecat_timestamp_series(coalesce(["created_at"]))
+    output_df["raw_event"] = prepared_df["raw_event"]
+
+    output_df["event_type"] = output_df["event_type"].astype(str).str.strip().str.upper()
+    output_df["store"] = output_df["store"].astype(str).str.strip().str.lower().replace("", "unknown")
+    output_df["environment"] = (
+        output_df["environment"].astype(str).str.strip().str.lower().replace("", "unknown")
+    )
+    output_df["alias_display"] = output_df["aliases"].apply(_format_revenuecat_list)
+    output_df["entitlement_display"] = output_df["entitlement_ids"].apply(_format_revenuecat_list)
+
+    sort_timestamp = output_df["event_timestamp"].combine_first(output_df["created_at"])
+    output_df = output_df.assign(_sort_timestamp=sort_timestamp).sort_values(
+        "_sort_timestamp",
+        ascending=False,
+        na_position="last",
+    )
+
+    return output_df[REVENUECAT_EVENT_DATASET_COLUMNS].reset_index(drop=True)
 
 
 def prepare_trip_metrics_dataset(trips_df: pd.DataFrame) -> pd.DataFrame:

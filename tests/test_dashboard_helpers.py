@@ -15,6 +15,7 @@ from dashboard_data import (
     get_trips_dataframe,
     normalize_subscription_tier,
     prepare_global_destinations_dataset,
+    prepare_revenuecat_events_dataset,
     to_week_start,
 )
 
@@ -128,6 +129,86 @@ def test_prepare_global_destinations_dataset_parses_mixed_iso_timestamps():
     assert prepared_df.iloc[0]["created_at"].isoformat() == "2026-04-22T17:19:14+00:00"
     assert prepared_df.iloc[0]["updated_at"].isoformat() == "2026-04-22T17:19:14.123456+00:00"
     assert prepared_df.iloc[0]["last_used_at"].isoformat() == "2026-04-23T09:05:01+00:00"
+
+
+def test_prepare_revenuecat_events_dataset_normalizes_raw_payload_fields():
+    event_timestamp_ms = int(pd.Timestamp("2026-04-10T12:00:00Z").timestamp() * 1000)
+    purchased_at_ms = int(pd.Timestamp("2026-04-10T11:58:00Z").timestamp() * 1000)
+    expiration_at_ms = int(pd.Timestamp("2026-05-10T11:58:00Z").timestamp() * 1000)
+    events_df = pd.DataFrame(
+        [
+            {
+                "id": "row-1",
+                "created_at": "2026-04-10T12:01:00Z",
+                "raw_event": {
+                    "event": {
+                        "id": "evt-1",
+                        "type": "INITIAL_PURCHASE",
+                        "app_user_id": "user-1",
+                        "aliases": ["anon-1", "user-1"],
+                        "product_id": "mtp_pro_monthly",
+                        "entitlement_ids": ["pro"],
+                        "store": "APP_STORE",
+                        "environment": "SANDBOX",
+                        "transaction_id": "tx-1",
+                        "original_transaction_id": "otx-1",
+                        "purchased_at_ms": purchased_at_ms,
+                        "expiration_at_ms": expiration_at_ms,
+                        "event_timestamp_ms": event_timestamp_ms,
+                    }
+                },
+            }
+        ]
+    )
+
+    prepared_df = prepare_revenuecat_events_dataset(events_df)
+    event = prepared_df.iloc[0]
+
+    assert event["revenuecat_event_id"] == "evt-1"
+    assert event["event_type"] == "INITIAL_PURCHASE"
+    assert event["app_user_id"] == "user-1"
+    assert event["alias_display"] == "anon-1, user-1"
+    assert event["product_id"] == "mtp_pro_monthly"
+    assert event["entitlement_display"] == "pro"
+    assert event["store"] == "app_store"
+    assert event["environment"] == "sandbox"
+    assert event["transaction_id"] == "tx-1"
+    assert event["original_transaction_id"] == "otx-1"
+    assert event["event_timestamp"].isoformat() == "2026-04-10T12:00:00+00:00"
+    assert event["purchased_at"].isoformat() == "2026-04-10T11:58:00+00:00"
+    assert event["expiration_at"].isoformat() == "2026-05-10T11:58:00+00:00"
+
+
+def test_prepare_revenuecat_events_dataset_prefers_direct_columns_and_sorts_latest_first():
+    events_df = pd.DataFrame(
+        [
+            {
+                "id": "row-older",
+                "revenuecat_event_id": "evt-older",
+                "event_type": "initial_purchase",
+                "app_user_id": "user-older",
+                "store": "play_store",
+                "environment": "production",
+                "event_timestamp": "2026-04-09T12:00:00Z",
+                "raw_event": {},
+            },
+            {
+                "id": "row-newer",
+                "revenuecat_event_id": "evt-newer",
+                "event_type": "renewal",
+                "app_user_id": "user-newer",
+                "store": "app_store",
+                "environment": "production",
+                "event_timestamp": "2026-04-10T12:00:00Z",
+                "raw_event": {},
+            },
+        ]
+    )
+
+    prepared_df = prepare_revenuecat_events_dataset(events_df)
+
+    assert prepared_df["revenuecat_event_id"].tolist() == ["evt-newer", "evt-older"]
+    assert prepared_df["event_type"].tolist() == ["RENEWAL", "INITIAL_PURCHASE"]
 
 
 def test_build_upgrade_conversion_funnel_counts_only_paywall_users_downstream():

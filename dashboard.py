@@ -19,6 +19,7 @@ from dashboard_analytics import (
     build_upgrade_purchase_summary,
 )
 from dashboard_data import (
+    REVENUECAT_EVENT_DATASET_COLUMNS,
     calculate_trip_duration_minutes,
     get_profile_dataset,
     get_trip_activity_dataset,
@@ -27,6 +28,7 @@ from dashboard_data import (
     normalize_trip_distance,
     parse_mixed_timestamp_series,
     prepare_global_destinations_dataset,
+    prepare_revenuecat_events_dataset,
 )
 from dashboard_metrics import (
     build_growth_metrics,
@@ -791,6 +793,42 @@ def get_upgrade_intent_events(_supabase: Client, lookback_days: int = 30):
         return pd.DataFrame()
 
 @st.cache_data(ttl=120)
+def get_revenuecat_events(_supabase: Client, lookback_days: int = 30, limit: int = 1000):
+    """Read RevenueCat webhook events from Supabase for dashboard monitoring."""
+    cutoff_dt = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=lookback_days)
+    cutoff_date = cutoff_dt.isoformat()
+    last_error = None
+
+    attempts = [
+        ("event_timestamp", True),
+        ("created_at", True),
+        ("event_timestamp", False),
+        ("created_at", False),
+        (None, False),
+    ]
+
+    for order_column, apply_cutoff in attempts:
+        try:
+            query = _supabase.table('revenuecat_events').select('*')
+            if apply_cutoff and order_column is not None:
+                query = query.gte(order_column, cutoff_date)
+            if order_column is not None:
+                query = query.order(order_column, desc=True)
+            response = query.limit(limit).execute()
+            events_df = pd.DataFrame(response.data or [])
+            prepared_df = prepare_revenuecat_events_dataset(events_df)
+
+            if not prepared_df.empty:
+                event_time = prepared_df['event_timestamp'].combine_first(prepared_df['created_at'])
+                prepared_df = prepared_df[event_time >= cutoff_dt].copy()
+
+            return prepared_df, None
+        except Exception as exc:
+            last_error = exc
+
+    return pd.DataFrame(columns=REVENUECAT_EVENT_DATASET_COLUMNS), str(last_error)
+
+@st.cache_data(ttl=120)
 def get_user_trip_completion(_supabase: Client):
     """Get trip completion summary per user."""
     try:
@@ -982,9 +1020,10 @@ def main():
         st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Main content area with tabs
-    tab1, tab2, tab12, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    tab1, tab2, tab13, tab12, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "📊 Overview",
         "💰 Revenue",
+        "💳 RevenueCat",
         "💸 Expenses",
         "📈 Growth",
         "🔴 Live Feed",
@@ -1220,6 +1259,232 @@ def main():
             st.info("**LTV**\n\nHold until you have real billing or payment-completion data. Estimated proxies would be noisy.")
         with col3:
             st.info("**CAC**\n\nRequires ad spend plus attributable acquisition channels. The current schema does not include either.")
+
+    # RevenueCat Webhook Monitor Tab
+    with tab13:
+        st.subheader("💳 RevenueCat Webhook Monitor")
+        st.caption("Source: `revenuecat_events` webhook table. This dashboard only reads events; it does not change subscription state.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            revenuecat_lookback_days = st.selectbox(
+                "Lookback window",
+                options=[1, 7, 14, 30, 60, 90, 180, 365],
+                index=3,
+                key="revenuecat_lookback_days"
+            )
+        with col2:
+            revenuecat_fetch_limit = st.selectbox(
+                "Events to scan",
+                options=[50, 100, 250, 500, 1000, 2500],
+                index=4,
+                key="revenuecat_fetch_limit"
+            )
+
+        revenuecat_df, revenuecat_error = get_revenuecat_events(
+            supabase,
+            lookback_days=revenuecat_lookback_days,
+            limit=revenuecat_fetch_limit,
+        )
+
+        if revenuecat_error:
+            st.error(f"Unable to read `revenuecat_events`: {revenuecat_error}")
+            st.info("Confirm the dashboard is using a server-side service role key and that the table exists in the connected Supabase project.")
+        elif revenuecat_df.empty:
+            st.info("No RevenueCat webhook events found for the selected period.")
+            st.caption("After a sandbox webhook or purchase event lands, this monitor will show webhook health, event counts, and raw payload inspection.")
+        else:
+            monitor_df = revenuecat_df.copy()
+            monitor_df['_event_time'] = monitor_df['event_timestamp'].combine_first(monitor_df['created_at'])
+            monitor_df = monitor_df.sort_values('_event_time', ascending=False, na_position='last')
+
+            now_utc = pd.Timestamp.now(tz="UTC")
+            latest_event_at = monitor_df['_event_time'].dropna().max()
+            if pd.notna(latest_event_at):
+                age_hours = (now_utc - latest_event_at).total_seconds() / 3600
+                if age_hours < 1:
+                    age_label = f"{int(max(0, age_hours * 60))}m"
+                elif age_hours < 48:
+                    age_label = f"{age_hours:.1f}h"
+                else:
+                    age_label = f"{age_hours / 24:.1f}d"
+                latest_event_label = latest_event_at.strftime('%Y-%m-%d %H:%M UTC')
+            else:
+                age_label = "unknown"
+                latest_event_label = "No timestamp"
+
+            events_last_24h = int((monitor_df['_event_time'] >= (now_utc - pd.Timedelta(hours=24))).sum())
+            unique_app_users = int(monitor_df['app_user_id'].dropna().astype(str).replace('', pd.NA).dropna().nunique())
+            sandbox_events = int((monitor_df['environment'].astype(str).str.lower() == 'sandbox').sum())
+            production_events = int((monitor_df['environment'].astype(str).str.lower() == 'production').sum())
+
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("Events", f"{len(monitor_df):,}", f"Last {revenuecat_lookback_days} days")
+            with col2:
+                st.metric("Latest", age_label)
+            with col3:
+                st.metric("Events (24h)", f"{events_last_24h:,}")
+            with col4:
+                st.metric("Unique App Users", f"{unique_app_users:,}")
+            with col5:
+                st.metric("Sandbox/Prod", f"{sandbox_events:,} / {production_events:,}")
+
+            if pd.notna(latest_event_at):
+                st.caption(f"Latest RevenueCat event timestamp: {latest_event_label}")
+
+            if pd.notna(latest_event_at) and (now_utc - latest_event_at) <= pd.Timedelta(hours=24):
+                st.success("RevenueCat webhook activity detected in the last 24 hours.")
+            else:
+                st.warning("No RevenueCat webhook activity detected in the last 24 hours for this lookback window.")
+
+            st.markdown("---")
+
+            environment_options = sorted(monitor_df['environment'].dropna().astype(str).unique().tolist())
+            store_options = sorted(monitor_df['store'].dropna().astype(str).unique().tolist())
+            event_type_options = sorted(monitor_df['event_type'].dropna().astype(str).unique().tolist())
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                selected_environments = st.multiselect(
+                    "Environment",
+                    options=environment_options,
+                    default=environment_options,
+                    key="revenuecat_environment_filter"
+                )
+            with col2:
+                selected_stores = st.multiselect(
+                    "Store",
+                    options=store_options,
+                    default=store_options,
+                    key="revenuecat_store_filter"
+                )
+            with col3:
+                selected_event_types = st.multiselect(
+                    "Event type",
+                    options=event_type_options,
+                    default=event_type_options,
+                    key="revenuecat_event_type_filter"
+                )
+
+            filtered_revenuecat_df = monitor_df.copy()
+            if selected_environments:
+                filtered_revenuecat_df = filtered_revenuecat_df[
+                    filtered_revenuecat_df['environment'].isin(selected_environments)
+                ]
+            if selected_stores:
+                filtered_revenuecat_df = filtered_revenuecat_df[
+                    filtered_revenuecat_df['store'].isin(selected_stores)
+                ]
+            if selected_event_types:
+                filtered_revenuecat_df = filtered_revenuecat_df[
+                    filtered_revenuecat_df['event_type'].isin(selected_event_types)
+                ]
+
+            if filtered_revenuecat_df.empty:
+                st.info("No RevenueCat events match the selected filters.")
+            else:
+                def build_count_df(dataframe, column, label):
+                    count_df = (
+                        dataframe[column]
+                        .fillna("unknown")
+                        .astype(str)
+                        .replace("", "unknown")
+                        .value_counts()
+                        .reset_index()
+                    )
+                    count_df.columns = [label, "Events"]
+                    return count_df
+
+                st.markdown("#### Event Counts")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    type_counts_df = build_count_df(filtered_revenuecat_df, 'event_type', 'Event Type')
+                    st.dataframe(type_counts_df, use_container_width=True, hide_index=True)
+                with col2:
+                    environment_counts_df = build_count_df(filtered_revenuecat_df, 'environment', 'Environment')
+                    st.dataframe(environment_counts_df, use_container_width=True, hide_index=True)
+                with col3:
+                    store_counts_df = build_count_df(filtered_revenuecat_df, 'store', 'Store')
+                    st.dataframe(store_counts_df, use_container_width=True, hide_index=True)
+
+                chart_counts_df = type_counts_df.head(12).sort_values('Events', ascending=True)
+                fig = px.bar(
+                    chart_counts_df,
+                    x='Events',
+                    y='Event Type',
+                    orientation='h',
+                    title="RevenueCat Events by Type",
+                    color='Events',
+                    color_continuous_scale='Blues'
+                )
+                fig.update_layout(height=360, showlegend=False, yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("---")
+                st.markdown("#### Latest 50 Events")
+
+                latest_events_df = filtered_revenuecat_df.sort_values(
+                    '_event_time',
+                    ascending=False,
+                    na_position='last'
+                ).head(50).copy()
+                latest_events_df['Time (UTC)'] = pd.to_datetime(
+                    latest_events_df['_event_time'],
+                    errors='coerce',
+                    utc=True
+                ).dt.strftime('%Y-%m-%d %H:%M:%S').fillna('-')
+                latest_events_df['Event Type'] = latest_events_df['event_type'].fillna('-')
+                latest_events_df['Environment'] = latest_events_df['environment'].fillna('-')
+                latest_events_df['Store'] = latest_events_df['store'].fillna('-')
+                latest_events_df['Product'] = latest_events_df['product_id'].fillna('-')
+                latest_events_df['Entitlements'] = latest_events_df['entitlement_display'].fillna('-')
+                latest_events_df['App User ID'] = latest_events_df['app_user_id'].fillna('-')
+                latest_events_df['Transaction ID'] = latest_events_df['transaction_id'].fillna('-')
+                latest_events_df['RevenueCat Event ID'] = latest_events_df['revenuecat_event_id'].fillna('-')
+
+                display_cols = [
+                    'Time (UTC)', 'Event Type', 'Environment', 'Store', 'Product',
+                    'Entitlements', 'App User ID', 'Transaction ID', 'RevenueCat Event ID'
+                ]
+                display_events_df = latest_events_df[display_cols]
+                st.dataframe(
+                    display_events_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Time (UTC)": st.column_config.TextColumn(width="medium"),
+                        "Event Type": st.column_config.TextColumn(width="medium"),
+                        "Product": st.column_config.TextColumn(width="medium"),
+                        "Entitlements": st.column_config.TextColumn(width="medium"),
+                        "App User ID": st.column_config.TextColumn(width="large"),
+                        "Transaction ID": st.column_config.TextColumn(width="large"),
+                        "RevenueCat Event ID": st.column_config.TextColumn(width="large"),
+                    }
+                )
+
+                st.markdown("#### Raw Event Inspection")
+                inspect_df = latest_events_df.reset_index(drop=True).copy()
+                inspect_df['_label'] = inspect_df.apply(
+                    lambda row: (
+                        f"{row.get('Time (UTC)', '-')} | {row.get('Event Type', '-')} | "
+                        f"{str(row.get('App User ID', '-'))[:24]} | {row.get('RevenueCat Event ID', '-')}"
+                    ),
+                    axis=1
+                )
+                selected_event_index = st.selectbox(
+                    "Select event payload",
+                    options=inspect_df.index.tolist(),
+                    format_func=lambda idx: inspect_df.loc[idx, '_label'],
+                    key="revenuecat_raw_event_selector"
+                )
+                selected_raw_event = inspect_df.loc[selected_event_index, 'raw_event']
+                if isinstance(selected_raw_event, (dict, list)):
+                    st.json(selected_raw_event)
+                elif selected_raw_event is None or pd.isna(selected_raw_event):
+                    st.info("No raw payload stored for this event.")
+                else:
+                    st.code(str(selected_raw_event), language="json")
     
     # Growth Metrics Tab
     with tab3:
